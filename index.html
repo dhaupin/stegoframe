@@ -7,6 +7,7 @@
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Syne:wght@700;800&display=swap" rel="stylesheet"/>
@@ -23,24 +24,67 @@
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: #2c3240; border-radius: 2px; }
     textarea, input, button { font-family: inherit; }
-    @keyframes fadeUp  { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
-    @keyframes pulse   { 0%,100%{opacity:1} 50%{opacity:0.3} }
-    @keyframes shimmer { from{opacity:0.4} to{opacity:0.9} }
+    @keyframes fadeUp { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes pulse  { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    @keyframes spin   { to{transform:rotate(360deg)} }
   </style>
 </head>
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useEffect, useRef, useCallback, useMemo } = React;
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUPABASE
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SUPA_URL  = "https://nqmexdrahboulluqfirb.supabase.co";
+const SUPA_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5xbWV4ZHJhaGJvdWxsdXFmaXJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxNzg0NjAsImV4cCI6MjA4ODc1NDQ2MH0.nT4imMarrT-M0zp_EEDAzNOcYmZJuVQGG05g0FnMCls";
+const sb = supabase.createClient(SUPA_URL, SUPA_ANON);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SESSION ID  — ephemeral per tab, persisted in sessionStorage
+// ═══════════════════════════════════════════════════════════════════════════
+
+function getSessionId() {
+  let id = sessionStorage.getItem("sf_sid");
+  if (!id) { id = crypto.randomUUID(); sessionStorage.setItem("sf_sid", id); }
+  return id;
+}
+const SESSION_ID = getSessionId();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// URL ROOM HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function getUrlParams() {
+  const p = new URLSearchParams(window.location.search);
+  return { room: p.get("room") || "", mode: p.get("mode") || "svg" };
+}
+function setUrlParams(room, mode) {
+  const u = new URL(window.location.href);
+  u.searchParams.set("room", room);
+  u.searchParams.set("mode", mode);
+  window.history.replaceState({}, "", u.toString());
+}
+function clearUrlParams() {
+  const u = new URL(window.location.href);
+  u.searchParams.delete("room");
+  u.searchParams.delete("mode");
+  window.history.replaceState({}, "", u.toString());
+}
+function makeRoomId() {
+  // 8 char alphanumeric room code
+  return Array.from(crypto.getRandomValues(new Uint8Array(6)))
+    .map(b => "abcdefghijklmnopqrstuvwxyz0123456789"[b % 36]).join("");
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CODEC
 // ═══════════════════════════════════════════════════════════════════════════
 
-const _PI = 100_000, _SB = 16, _IB = 12, _MG = 0x534746, _VR = 0x02;
-const Enc = Object.freeze({ SVG:"svg", LSB:"lsb" });
-const MS  = Object.freeze({ DECODED:"decoded", ENCODED:"encoded", FAILED:"failed", PENDING:"pending" });
-const CS  = Object.freeze({ OPEN:"open", CLOSED:"closed", EXPIRED:"expired" });
+const _PI=100_000,_SB=16,_IB=12,_MG=0x534746,_VR=0x02;
+const Enc=Object.freeze({SVG:"svg",LSB:"lsb"});
 
 async function _dk(p,s){
   const k=await crypto.subtle.importKey("raw",new TextEncoder().encode(p),{name:"PBKDF2"},false,["deriveKey"]);
@@ -95,43 +139,53 @@ function svgRead(url){
 const Codec={
   async encode(txt,pass,mode){const e=await _ae(txt,pass);return mode===Enc.LSB?lsbWrite(e):svgWrite(e);},
   async decode(url,pass){let r=svgRead(url);if(!r)r=await lsbRead(url);if(!r)return null;return _ad(r,pass);},
-  sniff(url){if(!url)return null;try{const peek=atob(url.split(",")[1]).slice(0,64);if(peek.includes("<svg"))return Enc.SVG;}catch{}return Enc.LSB;},
+  sniff(url){if(!url)return Enc.SVG;try{const p=atob(url.split(",")[1]).slice(0,64);if(p.includes("<svg"))return Enc.SVG;}catch{}return Enc.LSB;},
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CHANNEL
+// SUPABASE ROOM TRANSPORT
 // ═══════════════════════════════════════════════════════════════════════════
 
-let _msgN=0;
-function makeChannel(pass, enc, ttlMs){
-  const id=`ch_${Date.now().toString(36)}`;
-  let status=CS.OPEN, _key=pass;
-  const msgs=[], evs=new Map(), expiresAt=Date.now()+ttlMs;
-  const on=(ev,fn)=>{if(!evs.has(ev))evs.set(ev,[]);evs.get(ev).push(fn);return()=>{const a=evs.get(ev)??[];evs.set(ev,a.filter(f=>f!==fn));};};
-  const emit=(ev,d)=>{(evs.get(ev)??[]).forEach(f=>f(d));(evs.get("*")??[]).forEach(f=>f({event:ev,data:d}));};
-  function mkMsg(dir,st,enc2,carrier,raw,value,err){
-    return{id:`m${++_msgN}_${Date.now().toString(36)}`,dir,status:st,enc:enc2,carrier,raw,value,err,ts:Date.now()};
-  }
-  const ch={
-    id,enc,expiresAt,msgs,on,
-    get status(){return status;},
-    isOpen:()=>status===CS.OPEN,
-    async send(txt){
-      if(!ch.isOpen())throw new Error("closed");
-      const carrier=await Codec.encode(txt,_key,enc);
-      const m=mkMsg("out",MS.ENCODED,enc,carrier,txt,txt,null);
-      msgs.push(m);emit("msg",m);return m;
-    },
-    async receive(url){
-      if(!ch.isOpen())throw new Error("closed");
-      const raw=await Codec.decode(url,_key);
-      const m=mkMsg("in",raw?MS.DECODED:MS.FAILED,Codec.sniff(url)??enc,url,raw,raw,raw?null:"decryption failed — wrong key or no payload");
-      msgs.push(m);emit("msg",m);return m;
-    },
-    close(){status=CS.CLOSED;_key=null;emit("closed",{id});},
-  };
-  setTimeout(()=>{if(status!==CS.CLOSED){status=CS.EXPIRED;_key=null;emit("expired",{id});}},ttlMs);
-  return ch;
+// Post a carrier to the room. Returns the db row id.
+async function dbPost(roomId, carrier, mode, senderId) {
+  const { data, error } = await sb.from("messages").insert({
+    room_id: roomId, carrier, mode, sender_id: senderId,
+  }).select("id").single();
+  if (error) throw error;
+  return data.id;
+}
+
+// Load historical messages for a room (last 200, oldest first)
+async function dbLoad(roomId) {
+  const { data, error } = await sb
+    .from("messages").select("*")
+    .eq("room_id", roomId)
+    .order("ts", { ascending: true })
+    .limit(200);
+  if (error) throw error;
+  return data ?? [];
+}
+
+// Hard delete a message by id
+async function dbDelete(id) {
+  const { error } = await sb.from("messages").delete().eq("id", id);
+  if (error) throw error;
+}
+
+// Subscribe to realtime inserts/deletes for a room.
+// Returns unsubscribe fn.
+function dbSubscribe(roomId, onInsert, onDelete) {
+  const ch = sb.channel(`room:${roomId}`)
+    .on("postgres_changes", {
+      event: "INSERT", schema: "public", table: "messages",
+      filter: `room_id=eq.${roomId}`,
+    }, payload => onInsert(payload.new))
+    .on("postgres_changes", {
+      event: "DELETE", schema: "public", table: "messages",
+      filter: `room_id=eq.${roomId}`,
+    }, payload => onDelete(payload.old?.id))
+    .subscribe();
+  return () => sb.removeChannel(ch);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -147,10 +201,8 @@ const T={
   red:"#ff3d5a",rd:"#1a0508",
   amber:"#ffb840",
   blue:"#4db8ff",bd:"#001422",
-  out:"#0d1f2d",   // outbound bubble bg
-  outB:"#1a3a52",  // outbound bubble border
-  inc:"#0f1318",   // inbound bubble bg
-  incB:"#1e2229",  // inbound bubble border
+  out:"#0d1f2d",outB:"#1a3a52",
+  inc:"#0f1318",incB:"#1e2229",
 };
 const MONO="'DM Mono','Fira Code','Courier New',monospace";
 const DISP="'Syne',sans-serif";
@@ -172,52 +224,39 @@ function toDataUrl(s){
 function fmtTime(ts){return new Date(ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});}
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CARRIER THUMBNAIL  — small, tappable, shows full carrier on expand
+// CARRIER THUMBNAIL
 // ═══════════════════════════════════════════════════════════════════════════
 
-function CarrierThumb({carrier, enc, onCopy}){
+function CarrierThumb({carrier, mode}){
   const [open,setOpen]=useState(false);
-  const isSvg=enc===Enc.SVG||carrier?.startsWith("data:image/svg");
+  const [copied,setCopied]=useState(false);
+  const isSvg=mode===Enc.SVG||carrier?.startsWith("data:image/svg");
   if(!carrier)return null;
+  const copy=()=>navigator.clipboard?.writeText(carrier).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),1500);});
+  const dl=()=>{const a=document.createElement("a");a.href=carrier;a.download=`carrier.${isSvg?"svg":"png"}`;a.click();};
   return(
     <>
-      <div onClick={()=>setOpen(v=>!v)} title="tap to inspect carrier" style={{
-        display:"inline-flex",alignItems:"center",gap:6,marginTop:6,
-        cursor:"pointer",opacity:0.7,transition:"opacity 0.15s",
-      }}
-        onMouseEnter={e=>e.currentTarget.style.opacity=1}
-        onMouseLeave={e=>e.currentTarget.style.opacity=0.7}
-      >
-        <div style={{width:28,height:28,borderRadius:2,overflow:"hidden",border:`1px solid ${T.b1}`,flexShrink:0,background:T.raised}}>
+      <div onClick={()=>setOpen(v=>!v)} style={{display:"inline-flex",alignItems:"center",gap:6,marginTop:6,cursor:"pointer",opacity:0.65,transition:"opacity 0.15s"}}
+        onMouseEnter={e=>e.currentTarget.style.opacity=1} onMouseLeave={e=>e.currentTarget.style.opacity=0.65}>
+        <div style={{width:26,height:26,borderRadius:2,overflow:"hidden",border:`1px solid ${T.b1}`,flexShrink:0,background:T.raised}}>
           <img src={carrier} style={{width:"100%",height:"100%",imageRendering:isSvg?"auto":"pixelated",display:"block"}} alt=""/>
         </div>
-        <span style={{fontSize:8,color:T.muted,letterSpacing:"0.15em"}}>{isSvg?"SVG":"LSB"} carrier</span>
+        <span style={{fontSize:8,color:T.muted,letterSpacing:"0.15em"}}>{isSvg?"SVG":"LSB"} carrier {open?"▲":"▼"}</span>
       </div>
-
       {open&&(
-        <div style={{marginTop:8,background:T.raised,border:`1px solid ${T.b1}`,borderRadius:3,padding:10,animation:"fadeUp 0.2s ease"}}>
-          <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
-            <div style={{width:64,height:64,borderRadius:2,overflow:"hidden",border:`1px solid ${T.b1}`,flexShrink:0}}>
-              <img src={carrier} style={{width:"100%",height:"100%",imageRendering:isSvg?"auto":"pixelated",display:"block"}} alt="carrier"/>
+        <div style={{marginTop:6,background:T.raised,border:`1px solid ${T.b1}`,borderRadius:3,padding:10,animation:"fadeUp 0.15s ease"}}>
+          <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+            <div style={{width:56,height:56,borderRadius:2,overflow:"hidden",border:`1px solid ${T.b1}`,flexShrink:0}}>
+              <img src={carrier} style={{width:"100%",height:"100%",imageRendering:isSvg?"auto":"pixelated",display:"block"}} alt=""/>
             </div>
             <div style={{flex:1,minWidth:0}}>
-              <div style={{fontSize:8,color:T.muted,letterSpacing:"0.2em",marginBottom:6,textTransform:"uppercase"}}>{isSvg?"svg vector":"lsb raster"}</div>
-              <div style={{fontSize:8,color:T.dim,wordBreak:"break-all",lineHeight:1.5,maxHeight:36,overflow:"hidden"}}>
-                {carrier.split(",")[1]?.slice(0,60)}…
+              <div style={{fontSize:8,color:T.dim,wordBreak:"break-all",lineHeight:1.5,maxHeight:32,overflow:"hidden"}}>
+                {carrier.split(",")[1]?.slice(0,56)}…
               </div>
-              <div style={{display:"flex",gap:6,marginTop:8}}>
-                <button onClick={()=>navigator.clipboard?.writeText(carrier).then(()=>onCopy?.())} style={{
-                  background:"transparent",border:`1px solid ${T.b1}`,color:T.sub,
-                  padding:"3px 8px",fontSize:8,letterSpacing:"0.15em",cursor:"pointer",borderRadius:2,
-                }}>copy url</button>
-                <button onClick={()=>{const a=document.createElement("a");a.href=carrier;a.download=`carrier.${isSvg?"svg":"png"}`;a.click();}} style={{
-                  background:"transparent",border:`1px solid ${T.b1}`,color:T.sub,
-                  padding:"3px 8px",fontSize:8,letterSpacing:"0.15em",cursor:"pointer",borderRadius:2,
-                }}>↓ save</button>
-                <button onClick={()=>setOpen(false)} style={{
-                  background:"transparent",border:"none",color:T.dim,
-                  padding:"3px 6px",fontSize:10,cursor:"pointer",marginLeft:"auto",
-                }}>✕</button>
+              <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+                <Btn small ghost onClick={copy}>{copied?"copied ✓":"copy url"}</Btn>
+                <Btn small ghost onClick={dl}>↓ save</Btn>
+                <Btn small ghost onClick={()=>setOpen(false)}>✕</Btn>
               </div>
             </div>
           </div>
@@ -228,41 +267,73 @@ function CarrierThumb({carrier, enc, onCopy}){
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MESSAGE BUBBLE
+// PRIMITIVES
 // ═══════════════════════════════════════════════════════════════════════════
 
-function Bubble({msg}){
-  const [copied,setCopied]=useState(false);
-  const isOut=msg.dir==="out";
-  const failed=msg.status===MS.FAILED;
+function Btn({children,onClick,disabled,ghost,danger,small,style={}}){
+  const bg   = danger?T.rd : ghost?"transparent":T.raised;
+  const bdr  = danger?T.red : ghost?T.b1:T.b1;
+  const col  = danger?T.red : ghost?T.sub:T.txt;
+  return(
+    <button onClick={onClick} disabled={disabled} style={{
+      background:disabled?T.surf:bg, border:`1px solid ${disabled?T.b0:bdr}`,
+      color:disabled?T.dim:col, padding:small?"3px 8px":"8px 14px",
+      fontSize:small?8:9, letterSpacing:"0.18em", cursor:disabled?"not-allowed":"pointer",
+      borderRadius:2, transition:"all 0.15s", textTransform:"uppercase",
+      whiteSpace:"nowrap", ...style,
+    }}>{children}</button>
+  );
+}
 
-  const bg    = isOut ? T.out : T.inc;
-  const border= isOut ? T.outB : T.incB;
-  const align = isOut ? "flex-end" : "flex-start";
+// ═══════════════════════════════════════════════════════════════════════════
+// BUBBLE
+// ═══════════════════════════════════════════════════════════════════════════
 
-  const onCopy=()=>{setCopied(true);setTimeout(()=>setCopied(false),1500);};
+function Bubble({msg, isMine, onDelete}){
+  const [confirmDel,setConfirmDel]=useState(false);
+  const failed=msg.status==="failed";
+  const bg    = isMine ? T.out : T.inc;
+  const border= isMine ? T.outB : T.incB;
+  const align = isMine ? "flex-end" : "flex-start";
 
   return(
-    <div style={{display:"flex",flexDirection:"column",alignItems:align,marginBottom:12,animation:"fadeUp 0.2s ease"}}>
+    <div style={{display:"flex",flexDirection:"column",alignItems:align,marginBottom:14,animation:"fadeUp 0.2s ease",position:"relative"}}
+      onMouseEnter={e=>{if(isMine)e.currentTarget.querySelector(".del-btn")?.style&&(e.currentTarget.querySelector(".del-btn").style.opacity=1);}}
+      onMouseLeave={e=>{if(isMine)e.currentTarget.querySelector(".del-btn")?.style&&(e.currentTarget.querySelector(".del-btn").style.opacity=0);}}>
+
+      {/* delete button — own messages only */}
+      {isMine&&!confirmDel&&(
+        <button className="del-btn" onClick={()=>setConfirmDel(true)} style={{
+          position:"absolute",top:-6,right:-6,width:18,height:18,borderRadius:"50%",
+          background:T.rd,border:`1px solid ${T.red}`,color:T.red,
+          fontSize:9,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",
+          opacity:0,transition:"opacity 0.15s",zIndex:2,lineHeight:1,
+        }}>✕</button>
+      )}
+      {isMine&&confirmDel&&(
+        <div style={{display:"flex",gap:4,marginBottom:4,animation:"fadeUp 0.1s ease"}}>
+          <Btn small danger onClick={()=>{onDelete(msg.dbId);setConfirmDel(false);}}>delete</Btn>
+          <Btn small ghost onClick={()=>setConfirmDel(false)}>cancel</Btn>
+        </div>
+      )}
+
       <div style={{
-        maxWidth:"75%",minWidth:80,
-        background:bg,border:`1px solid ${border}`,borderRadius:isOut?"10px 10px 2px 10px":"10px 10px 10px 2px",
-        padding:"10px 12px",position:"relative",
+        maxWidth:"78%",minWidth:80,background:bg,border:`1px solid ${border}`,
+        borderRadius:isMine?"10px 10px 2px 10px":"10px 10px 10px 2px",padding:"10px 13px",
       }}>
-        {failed?(
-          <div style={{fontSize:11,color:T.red,lineHeight:1.6}}>{msg.err}</div>
-        ):(
-          <>
-            <div style={{fontSize:13,color:T.bright,lineHeight:1.7,wordBreak:"break-word",whiteSpace:"pre-wrap"}}>
-              {typeof msg.value==="object"?JSON.stringify(msg.value,null,2):msg.value}
-            </div>
-            <CarrierThumb carrier={msg.carrier} enc={msg.enc} onCopy={onCopy}/>
-            {copied&&<div style={{fontSize:8,color:T.green,marginTop:4,letterSpacing:"0.1em"}}>copied ✓</div>}
-          </>
-        )}
+        {failed
+          ? <div style={{fontSize:11,color:T.red,lineHeight:1.6}}>{msg.err}</div>
+          : <>
+              <div style={{fontSize:13,color:T.bright,lineHeight:1.7,wordBreak:"break-word",whiteSpace:"pre-wrap"}}>
+                {typeof msg.value==="object"?JSON.stringify(msg.value,null,2):msg.value}
+              </div>
+              <CarrierThumb carrier={msg.carrier} mode={msg.mode}/>
+            </>
+        }
       </div>
-      <div style={{fontSize:8,color:T.dim,marginTop:3,letterSpacing:"0.1em",paddingLeft:isOut?0:4,paddingRight:isOut?4:0}}>
-        {fmtTime(msg.ts)} · {isOut?"you":"them"} · {(msg.enc||"?").toUpperCase()}
+      <div style={{fontSize:8,color:T.dim,marginTop:3,letterSpacing:"0.1em",
+        paddingLeft:isMine?0:4,paddingRight:isMine?4:0}}>
+        {fmtTime(msg.ts)} · {isMine?"you":"them"} · {(msg.mode||"?").toUpperCase()}
         {failed&&" · failed"}
       </div>
     </div>
@@ -273,76 +344,170 @@ function Bubble({msg}){
 // CHAT VIEW
 // ═══════════════════════════════════════════════════════════════════════════
 
-function ChatView({channel, onClose}){
-  const [msgs,setMsgs]      = useState([]);
-  const [text,setText]      = useState("");
-  const [busy,setBusy]      = useState(false);
-  const [dragOver,setDrag]  = useState(false);
-  const [now,setNow]        = useState(Date.now());
-  const [inputMode,setInputMode] = useState("text"); // "text" | "receive"
-  const [pasteInput,setPasteInput] = useState("");
-  const bottomRef = useRef();
+function ChatView({roomId, mode, passphrase, onLeave}){
+  const [msgs,setMsgs]       = useState([]);
+  const [text,setText]       = useState("");
+  const [busy,setBusy]       = useState(false);
+  const [loading,setLoading] = useState(true);
+  const [error,setError]     = useState(null);
+  const [dragOver,setDrag]   = useState(false);
+  const [pasteMode,setPaste] = useState(false);
+  const [pasteVal,setPasteVal]= useState("");
+  const [connState,setConn]  = useState("connecting"); // connecting|live|error
+  const bottomRef   = useRef();
   const textareaRef = useRef();
-  const fileRef = useRef();
+  const fileRef     = useRef();
+  // Tab-switch guard: track when tab became visible to ignore stale sends
+  const lastVisibleRef = useRef(Date.now());
 
-  // tick TTL
-  useEffect(()=>{const t=setInterval(()=>setNow(Date.now()),1000);return()=>clearInterval(t);},[]);
-
-  // subscribe to channel
+  // ── load history ──────────────────────────────────────────────────────────
   useEffect(()=>{
-    if(!channel)return;
-    setMsgs([...channel.msgs]);
-    const u=channel.on("msg",m=>setMsgs(prev=>[...prev,m]));
-    return()=>u();
-  },[channel]);
+    setLoading(true);setError(null);
+    dbLoad(roomId).then(async rows=>{
+      const decoded=await Promise.all(rows.map(r=>decodeRow(r,passphrase,mode)));
+      setMsgs(decoded.filter(Boolean));
+      setLoading(false);
+    }).catch(e=>{setError("Failed to load messages: "+e.message);setLoading(false);});
+  },[roomId,passphrase]);
 
-  // scroll to bottom on new messages
+  // ── realtime subscription ─────────────────────────────────────────────────
+  useEffect(()=>{
+    setConn("connecting");
+    const unsub=dbSubscribe(
+      roomId,
+      async row=>{
+        // ignore own inserts (we already added them optimistically)
+        if(row.sender_id===SESSION_ID)return;
+        const m=await decodeRow(row,passphrase,mode);
+        if(m)setMsgs(prev=>[...prev,m]);
+        setConn("live");
+      },
+      id=>{
+        setMsgs(prev=>prev.filter(m=>m.dbId!==id));
+      }
+    );
+    // Mark connected after a beat
+    const t=setTimeout(()=>setConn("live"),2000);
+    return()=>{unsub();clearTimeout(t);};
+  },[roomId,passphrase]);
+
+  // ── scroll on new messages ────────────────────────────────────────────────
   useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:"smooth"}); },[msgs]);
 
-  // global paste listener
-  const handlePaste = useCallback(e=>{
-    // if typing in textarea, let browser handle it
+  // ── tab visibility guard ──────────────────────────────────────────────────
+  useEffect(()=>{
+    const handler=()=>{
+      if(document.visibilityState==="visible"){
+        lastVisibleRef.current=Date.now();
+        // blur active input to prevent stale submit on re-focus
+        if(document.activeElement===textareaRef.current){
+          textareaRef.current.blur();
+        }
+      }
+    };
+    document.addEventListener("visibilitychange",handler);
+    return()=>document.removeEventListener("visibilitychange",handler);
+  },[]);
+
+  // ── global paste ──────────────────────────────────────────────────────────
+  const handlePaste=useCallback(e=>{
     if(document.activeElement===textareaRef.current)return;
+    // ignore if tab just became visible (stale paste guard — 800ms window)
+    if(Date.now()-lastVisibleRef.current<800)return;
     const items=Array.from(e.clipboardData?.items??[]);
-    const imgItem=items.find(i=>i.type.startsWith("image/"));
-    if(imgItem){receiveFile(imgItem.getAsFile());return;}
-    const txtItem=items.find(i=>i.kind==="string");
-    if(txtItem)txtItem.getAsString(s=>{const u=toDataUrl(s);if(u)receiveUrl(u);});
-  },[channel]);
+    const img=items.find(i=>i.type.startsWith("image/"));
+    if(img){receiveFile(img.getAsFile());return;}
+    const txt=items.find(i=>i.kind==="string");
+    if(txt)txt.getAsString(s=>{const u=toDataUrl(s);if(u)receiveCarrier(u);});
+  },[passphrase,mode]);
 
-  useEffect(()=>{document.addEventListener("paste",handlePaste);return()=>document.removeEventListener("paste",handlePaste);},[handlePaste]);
+  useEffect(()=>{
+    document.addEventListener("paste",handlePaste);
+    return()=>document.removeEventListener("paste",handlePaste);
+  },[handlePaste]);
 
-  // send outbound
-  const send = async()=>{
-    const t=text.trim();if(!t||!channel?.isOpen()||busy)return;
+  // ── decode a db row into a local message object ───────────────────────────
+  async function decodeRow(row,pass,expectedMode){
+    const raw=await Codec.decode(row.carrier,pass);
+    const isMine=row.sender_id===SESSION_ID;
+    return{
+      dbId:row.id,
+      localId:`local_${row.id}`,
+      dir:isMine?"out":"in",
+      status:raw?"decoded":"failed",
+      mode:row.mode||expectedMode,
+      carrier:row.carrier,
+      value:raw,
+      err:raw?null:"decryption failed — wrong key or different mode",
+      ts:new Date(row.ts).getTime(),
+      senderId:row.sender_id,
+    };
+  }
+
+  // ── send ──────────────────────────────────────────────────────────────────
+  const send=async()=>{
+    const t=text.trim();
+    if(!t||busy)return;
+    // Tab-switch guard: don't fire if tab just became visible
+    if(Date.now()-lastVisibleRef.current<800)return;
     setBusy(true);setText("");
-    try{await channel.send(t);}
-    finally{setBusy(false);}
+    try{
+      const carrier=await Codec.encode(t,passphrase,mode);
+      // optimistic local insert
+      const optimistic={
+        dbId:null,localId:`opt_${Date.now()}`,
+        dir:"out",status:"encoded",mode,carrier,value:t,err:null,ts:Date.now(),senderId:SESSION_ID,
+      };
+      setMsgs(prev=>[...prev,optimistic]);
+      // push to db
+      const dbId=await dbPost(roomId,carrier,mode,SESSION_ID);
+      // patch optimistic with real db id
+      setMsgs(prev=>prev.map(m=>m.localId===optimistic.localId?{...m,dbId}:m));
+    }catch(e){
+      setMsgs(prev=>[...prev,{
+        dbId:null,localId:`err_${Date.now()}`,dir:"out",status:"failed",
+        mode,carrier:null,value:null,err:"send failed: "+e.message,ts:Date.now(),senderId:SESSION_ID,
+      }]);
+    }finally{setBusy(false);}
   };
 
-  // receive inbound carrier
-  const receiveUrl = async(url)=>{
-    if(!channel?.isOpen()||!url)return;
+  // ── receive carrier ───────────────────────────────────────────────────────
+  const receiveCarrier=async(url)=>{
+    if(!url)return;
     setBusy(true);
-    try{await channel.receive(url);}
-    finally{setBusy(false);}
+    try{
+      const raw=await Codec.decode(url,passphrase);
+      const m={
+        dbId:null,localId:`recv_${Date.now()}`,dir:"in",
+        status:raw?"decoded":"failed",
+        mode:Codec.sniff(url),carrier:url,value:raw,
+        err:raw?null:"decryption failed — wrong key or no payload",
+        ts:Date.now(),senderId:"external",
+      };
+      setMsgs(prev=>[...prev,m]);
+    }finally{setBusy(false);}
   };
 
   const receiveFile=(file)=>{
-    const r=new FileReader();r.onload=e=>receiveUrl(e.target.result);r.readAsDataURL(file);
+    const r=new FileReader();r.onload=e=>receiveCarrier(e.target.result);r.readAsDataURL(file);
   };
 
-  const submitPaste=()=>{
-    const u=toDataUrl(pasteInput.trim());
-    if(u){receiveUrl(u);setPasteInput("");}
+  // ── delete ────────────────────────────────────────────────────────────────
+  const deleteMsg=async(dbId)=>{
+    if(!dbId)return;
+    try{
+      await dbDelete(dbId);
+      setMsgs(prev=>prev.filter(m=>m.dbId!==dbId));
+    }catch(e){console.error("delete failed",e);}
   };
 
-  // channel status
-  const rem=Math.max(0,channel.expiresAt-now);
-  const hh=Math.floor(rem/3600000),mm=Math.floor((rem%3600000)/60000),ss=Math.floor((rem%60000)/1000);
-  const ttl=`${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
-  const chOpen=channel.isOpen();
-  const statusColor={[CS.OPEN]:T.green,[CS.CLOSED]:T.muted,[CS.EXPIRED]:T.red}[channel.status]??T.muted;
+  // ── share url ─────────────────────────────────────────────────────────────
+  const shareUrl=()=>{
+    const url=window.location.href;
+    navigator.clipboard?.writeText(url).then(()=>alert("Room URL copied!\n\nShare it — the other party will be prompted for the passphrase."));
+  };
+
+  const connColor={connecting:T.amber,live:T.green,error:T.red}[connState]??T.dim;
 
   return(
     <div style={{height:"100%",display:"flex",flexDirection:"column",background:T.bg}}>
@@ -353,144 +518,137 @@ function ChatView({channel, onClose}){
           STEGO<span style={{color:T.green}}>FRAME</span>
         </div>
         <div style={{width:1,height:14,background:T.b1}}/>
-        <span style={{fontSize:8,color:T.muted,letterSpacing:"0.25em"}}>#{channel.id.slice(-6)}</span>
-        <span style={{fontSize:8,color:T.dim,letterSpacing:"0.2em"}}>{channel.enc.toUpperCase()}</span>
-        <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:10}}>
-          {/* TTL */}
-          <span style={{fontSize:8,color:rem<300000?T.red:T.dim,letterSpacing:"0.15em",fontVariantNumeric:"tabular-nums"}}>
-            {ttl}
-          </span>
-          {/* status dot */}
-          <span style={{width:6,height:6,borderRadius:"50%",background:statusColor,display:"inline-block",animation:chOpen?"pulse 2s infinite":"none"}}/>
-          {/* close */}
-          {chOpen&&(
-            <button onClick={onClose} style={{background:"transparent",border:`1px solid ${T.rd}`,color:T.red,padding:"3px 8px",fontSize:8,letterSpacing:"0.15em",cursor:"pointer",borderRadius:2}}>
-              close
-            </button>
-          )}
+        <span style={{fontSize:9,color:T.muted,letterSpacing:"0.2em",fontFamily:MONO}}>#{roomId}</span>
+        <span style={{fontSize:8,color:T.dim,letterSpacing:"0.2em"}}>{mode.toUpperCase()}</span>
+        {/* connection dot */}
+        <span title={connState} style={{width:5,height:5,borderRadius:"50%",background:connColor,display:"inline-block",
+          animation:connState==="connecting"?"pulse 1s infinite":"none",flexShrink:0}}/>
+        <div style={{marginLeft:"auto",display:"flex",gap:8}}>
+          <Btn small ghost onClick={shareUrl}>share room</Btn>
+          <Btn small danger onClick={onLeave}>leave</Btn>
         </div>
       </div>
 
       {/* ── thread ── */}
-      <div style={{flex:1,overflowY:"auto",padding:"16px 16px 4px",display:"flex",flexDirection:"column"}}
+      <div
+        style={{flex:1,overflowY:"auto",padding:"16px 16px 4px",display:"flex",flexDirection:"column"}}
         onDragOver={e=>{e.preventDefault();setDrag(true);}}
         onDragLeave={()=>setDrag(false)}
-        onDrop={e=>{e.preventDefault();setDrag(false);const f=e.dataTransfer.files[0];if(f)receiveFile(f);else{const s=e.dataTransfer.getData("text");const u=toDataUrl(s);if(u)receiveUrl(u);}}}
+        onDrop={e=>{e.preventDefault();setDrag(false);const f=e.dataTransfer.files[0];if(f)receiveFile(f);else{const s=e.dataTransfer.getData("text");const u=toDataUrl(s);if(u)receiveCarrier(u);}}}
       >
         {dragOver&&(
-          <div style={{position:"fixed",inset:0,background:"rgba(29,255,143,0.05)",border:`2px dashed ${T.green}`,zIndex:50,display:"flex",alignItems:"center",justifyContent:"center",pointerEvents:"none"}}>
+          <div style={{position:"fixed",inset:0,background:"rgba(29,255,143,0.04)",border:`2px dashed ${T.green}`,zIndex:50,display:"flex",alignItems:"center",justifyContent:"center",pointerEvents:"none"}}>
             <span style={{fontSize:11,color:T.green,letterSpacing:"0.3em"}}>DROP CARRIER</span>
           </div>
         )}
 
-        {msgs.length===0&&(
-          <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8,opacity:0.35}}>
-            <div style={{fontSize:10,letterSpacing:"0.3em",color:T.muted}}>NO TRANSMISSIONS</div>
-            <div style={{fontSize:8,letterSpacing:"0.2em",color:T.dim}}>type a message or paste a carrier to begin</div>
+        {loading&&(
+          <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <div style={{width:16,height:16,border:`2px solid ${T.b1}`,borderTopColor:T.green,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/>
           </div>
         )}
 
-        {msgs.map(m=><Bubble key={m.id} msg={m}/>)}
+        {!loading&&error&&(
+          <div style={{padding:16,color:T.red,fontSize:10,letterSpacing:"0.1em",lineHeight:1.6}}>{error}</div>
+        )}
+
+        {!loading&&!error&&msgs.length===0&&(
+          <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8,opacity:0.3}}>
+            <div style={{fontSize:10,letterSpacing:"0.3em",color:T.muted}}>NO TRANSMISSIONS</div>
+            <div style={{fontSize:8,letterSpacing:"0.2em",color:T.dim}}>type a message to begin</div>
+          </div>
+        )}
+
+        {!loading&&msgs.map(m=>(
+          <Bubble key={m.localId||m.dbId} msg={m} isMine={m.senderId===SESSION_ID} onDelete={deleteMsg}/>
+        ))}
         <div ref={bottomRef}/>
       </div>
 
-      {/* ── receive input (expandable) ── */}
-      {inputMode==="receive"&&(
+      {/* ── paste carrier bar (toggleable) ── */}
+      {pasteMode&&(
         <div style={{padding:"8px 12px",background:T.surf,borderTop:`1px solid ${T.b0}`,flexShrink:0,animation:"fadeUp 0.15s ease"}}>
-          <div style={{fontSize:8,color:T.muted,letterSpacing:"0.2em",marginBottom:6,textTransform:"uppercase"}}>paste carrier url or base64</div>
+          <div style={{fontSize:8,color:T.muted,letterSpacing:"0.2em",marginBottom:6,textTransform:"uppercase"}}>paste carrier · data url or base64</div>
           <div style={{display:"flex",gap:6}}>
-            <input
-              value={pasteInput} onChange={e=>setPasteInput(e.target.value)}
-              onKeyDown={e=>{if(e.key==="Enter")submitPaste();if(e.key==="Escape")setInputMode("text");}}
-              placeholder="data:image/... or bare base64"
-              autoFocus
+            <input value={pasteVal} onChange={e=>setPasteVal(e.target.value)}
+              onKeyDown={e=>{
+                if(e.key==="Enter"){const u=toDataUrl(pasteVal.trim());if(u){receiveCarrier(u);setPasteVal("");setPaste(false);}}
+                if(e.key==="Escape"){setPaste(false);setPasteVal("");}
+              }}
+              placeholder="data:image/... or bare base64" autoFocus
               style={{flex:1,background:T.raised,border:`1px solid ${T.b1}`,color:T.bright,padding:"8px 10px",fontSize:11,outline:"none",borderRadius:2}}
             />
-            <button onClick={submitPaste} style={{background:T.gd,border:`1px solid ${T.green}`,color:T.green,padding:"0 12px",fontSize:9,letterSpacing:"0.15em",cursor:"pointer",borderRadius:2}}>→</button>
-            <button onClick={()=>{setInputMode("text");setPasteInput("");}} style={{background:"transparent",border:`1px solid ${T.b1}`,color:T.muted,padding:"0 10px",fontSize:9,cursor:"pointer",borderRadius:2}}>✕</button>
-          </div>
-          <div style={{fontSize:8,color:T.dim,marginTop:5,letterSpacing:"0.1em"}}>
-            you can also drop a file anywhere on the thread, or paste an image with Ctrl+V / ⌘+V
+            <Btn onClick={()=>{const u=toDataUrl(pasteVal.trim());if(u){receiveCarrier(u);setPasteVal("");setPaste(false);}}}>→</Btn>
+            <Btn ghost onClick={()=>{setPaste(false);setPasteVal("");}}>✕</Btn>
           </div>
         </div>
       )}
 
       {/* ── compose bar ── */}
       <div style={{background:T.raised,borderTop:`1px solid ${T.b0}`,padding:"10px 12px",flexShrink:0,display:"flex",gap:8,alignItems:"flex-end"}}>
-
-        {/* attach / receive button */}
+        {/* attach buttons */}
         <div style={{display:"flex",flexDirection:"column",gap:4,flexShrink:0}}>
-          <button
-            onClick={()=>fileRef.current?.click()}
-            title="upload carrier file"
-            style={{background:"transparent",border:`1px solid ${T.b1}`,color:T.muted,width:34,height:34,cursor:"pointer",borderRadius:2,fontSize:14,display:"flex",alignItems:"center",justifyContent:"center"}}
-          >⊕</button>
-          <button
-            onClick={()=>setInputMode(m=>m==="receive"?"text":"receive")}
-            title="paste carrier URL or base64"
-            style={{background:inputMode==="receive"?T.gd:"transparent",border:`1px solid ${inputMode==="receive"?T.green:T.b1}`,color:inputMode==="receive"?T.green:T.muted,width:34,height:34,cursor:"pointer",borderRadius:2,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center"}}
-          >⌗</button>
+          <button onClick={()=>fileRef.current?.click()} title="upload carrier file"
+            style={{background:"transparent",border:`1px solid ${T.b1}`,color:T.muted,width:34,height:34,cursor:"pointer",borderRadius:2,fontSize:15,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            ⊕
+          </button>
+          <button onClick={()=>setPaste(v=>!v)} title="paste carrier base64"
+            style={{background:pasteMode?T.gd:"transparent",border:`1px solid ${pasteMode?T.green:T.b1}`,color:pasteMode?T.green:T.muted,width:34,height:34,cursor:"pointer",borderRadius:2,fontSize:13,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            ⌗
+          </button>
         </div>
 
-        <input ref={fileRef} type="file" accept="image/*,.svg" style={{display:"none"}} onChange={e=>{if(e.target.files[0])receiveFile(e.target.files[0]);e.target.value="";}}/>
+        <input ref={fileRef} type="file" accept="image/*,.svg" style={{display:"none"}}
+          onChange={e=>{if(e.target.files[0])receiveFile(e.target.files[0]);e.target.value="";}}/>
 
         {/* text input */}
-        <textarea
-          ref={textareaRef}
-          value={text}
+        <textarea ref={textareaRef} value={text}
           onChange={e=>{setText(e.target.value);e.target.style.height="auto";e.target.style.height=Math.min(e.target.scrollHeight,120)+"px";}}
           onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}}
-          placeholder={chOpen?"type a message…":"channel closed"}
-          disabled={!chOpen||busy}
-          rows={1}
-          style={{
-            flex:1,background:T.surf,border:`1px solid ${T.b0}`,color:T.bright,
-            padding:"9px 12px",fontSize:13,outline:"none",borderRadius:6,
-            lineHeight:1.6,resize:"none",minHeight:38,maxHeight:120,overflow:"auto",
-          }}
+          placeholder="type a message…" rows={1} disabled={busy}
+          style={{flex:1,background:T.surf,border:`1px solid ${T.b0}`,color:T.bright,padding:"9px 12px",fontSize:13,outline:"none",borderRadius:6,lineHeight:1.6,resize:"none",minHeight:38,maxHeight:120,overflow:"auto"}}
         />
 
         {/* send */}
-        <button
-          onClick={send}
-          disabled={!text.trim()||!chOpen||busy}
-          style={{
-            background:(!text.trim()||!chOpen||busy)?T.surf:T.gd,
-            border:`1px solid ${(!text.trim()||!chOpen||busy)?T.b1:T.green}`,
-            color:(!text.trim()||!chOpen||busy)?T.dim:T.green,
-            width:38,height:38,cursor:(!text.trim()||!chOpen||busy)?"not-allowed":"pointer",
-            borderRadius:2,fontSize:14,flexShrink:0,transition:"all 0.15s",
-            display:"flex",alignItems:"center",justifyContent:"center",
-          }}
-        >{busy?"…":"↑"}</button>
+        <button onClick={send} disabled={!text.trim()||busy}
+          style={{background:(!text.trim()||busy)?T.surf:T.gd,border:`1px solid ${(!text.trim()||busy)?T.b1:T.green}`,
+            color:(!text.trim()||busy)?T.dim:T.green,width:38,height:38,cursor:(!text.trim()||busy)?"not-allowed":"pointer",
+            borderRadius:2,fontSize:16,flexShrink:0,transition:"all 0.15s",display:"flex",alignItems:"center",justifyContent:"center"}}>
+          {busy?"…":"↑"}
+        </button>
       </div>
     </div>
   );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SETUP SCREEN
+// SETUP / JOIN SCREEN
 // ═══════════════════════════════════════════════════════════════════════════
 
-function Setup({onOpen}){
+function Setup({onJoin}){
+  const urlParams=getUrlParams();
+  // If room+mode in URL, we're joining an existing room
+  const isJoining=!!urlParams.room;
+
   const [pass,setPass]   = useState("");
-  const [enc,setEnc]     = useState(Enc.SVG);
-  const [ttl,setTtl]     = useState("4");
+  const [mode,setMode]   = useState(urlParams.mode||"svg");
+  const [ttl,setTtl]     = useState("4");  // hours, not used server-side but kept for UX
   const [err,setErr]     = useState("");
   const [show,setShow]   = useState(false);
+  const [roomId]         = useState(isJoining?urlParams.room:makeRoomId());
 
-  const open=()=>{
+  const join=()=>{
     if(!pass.trim()){setErr("passphrase required");return;}
     if(pass.trim().length<4){setErr("at least 4 characters");return;}
-    const ms=Math.max(0.1,parseFloat(ttl)||4)*3600000;
-    onOpen(makeChannel(pass.trim(),enc,ms));
+    setUrlParams(roomId,mode);
+    onJoin({roomId,mode,passphrase:pass.trim()});
   };
 
   return(
-    <div style={{height:"100%",display:"flex",alignItems:"center",justifyContent:"center",background:T.bg,padding:20}}>
+    <div style={{height:"100%",display:"flex",alignItems:"center",justifyContent:"center",background:T.bg,padding:20,overflowY:"auto"}}>
       <div style={{width:"100%",maxWidth:380}}>
 
-        <div style={{textAlign:"center",marginBottom:36}}>
+        <div style={{textAlign:"center",marginBottom:32}}>
           <div style={{fontFamily:DISP,fontSize:30,fontWeight:800,color:T.white,letterSpacing:"0.06em"}}>
             STEGO<span style={{color:T.green}}>FRAME</span>
           </div>
@@ -498,20 +656,30 @@ function Setup({onOpen}){
         </div>
 
         <div style={{background:T.surf,border:`1px solid ${T.b0}`,borderRadius:4,overflow:"hidden"}}>
-          <div style={{padding:"11px 16px",borderBottom:`1px solid ${T.b0}`}}>
-            <div style={{fontSize:9,letterSpacing:"0.3em",color:T.sub,textTransform:"uppercase"}}>open channel</div>
+          <div style={{padding:"11px 16px",borderBottom:`1px solid ${T.b0}`,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <div style={{fontSize:9,letterSpacing:"0.3em",color:T.sub,textTransform:"uppercase"}}>
+              {isJoining?"join room":"create room"}
+            </div>
+            <div style={{fontSize:8,color:T.dim,letterSpacing:"0.15em",fontFamily:MONO}}>#{roomId}</div>
           </div>
+
           <div style={{padding:20,display:"flex",flexDirection:"column",gap:16}}>
+
+            {isJoining&&(
+              <div style={{background:T.gd,border:`1px solid ${T.green}`,borderRadius:2,padding:"8px 12px",fontSize:9,color:T.green,lineHeight:1.7,letterSpacing:"0.05em"}}>
+                You've been invited to room <strong>#{roomId}</strong> in {mode.toUpperCase()} mode.
+                Enter the shared passphrase to join.
+              </div>
+            )}
 
             {/* passphrase */}
             <div>
               <div style={{fontSize:8,color:T.muted,letterSpacing:"0.25em",textTransform:"uppercase",marginBottom:6}}>passphrase</div>
               <div style={{position:"relative"}}>
-                <input
-                  type={show?"text":"password"} value={pass}
+                <input type={show?"text":"password"} value={pass}
                   onChange={e=>{setPass(e.target.value);setErr("");}}
-                  onKeyDown={e=>{if(e.key==="Enter")open();}}
-                  placeholder="shared secret…"
+                  onKeyDown={e=>{if(e.key==="Enter")join();}}
+                  placeholder={isJoining?"enter shared passphrase…":"choose a shared secret…"}
                   autoFocus
                   style={{width:"100%",background:T.raised,border:`1px solid ${err?T.red:T.b1}`,color:T.bright,padding:"9px 44px 9px 12px",fontSize:13,outline:"none",borderRadius:3}}
                 />
@@ -522,58 +690,58 @@ function Setup({onOpen}){
               {err&&<div style={{fontSize:9,color:T.red,marginTop:5}}>{err}</div>}
             </div>
 
-            {/* encoding — fixed per channel */}
-            <div>
-              <div style={{fontSize:8,color:T.muted,letterSpacing:"0.25em",textTransform:"uppercase",marginBottom:6}}>encoding mode</div>
-              <div style={{display:"flex",gap:6}}>
-                {[Enc.SVG,Enc.LSB].map(m=>(
-                  <button key={m} onClick={()=>setEnc(m)} style={{
-                    flex:1,padding:"10px 0",
-                    background:enc===m?T.gd:"transparent",
-                    border:`1px solid ${enc===m?T.green:T.b1}`,
-                    color:enc===m?T.green:T.muted,
-                    fontSize:9,letterSpacing:"0.2em",cursor:"pointer",borderRadius:3,textTransform:"uppercase",
-                  }}>
-                    <div style={{fontWeight:enc===m?500:400}}>{m}</div>
-                    <div style={{fontSize:7,color:enc===m?T.green:T.dim,marginTop:3,letterSpacing:"0.1em"}}>
-                      {m===Enc.SVG?"vector · xml embed":"raster · pixel lsb"}
-                    </div>
-                  </button>
-                ))}
+            {/* encoding mode — only shown when creating */}
+            {!isJoining&&(
+              <div>
+                <div style={{fontSize:8,color:T.muted,letterSpacing:"0.25em",textTransform:"uppercase",marginBottom:6}}>encoding mode</div>
+                <div style={{display:"flex",gap:6}}>
+                  {[Enc.SVG,Enc.LSB].map(m=>(
+                    <button key={m} onClick={()=>setMode(m)} style={{
+                      flex:1,padding:"9px 0",
+                      background:mode===m?T.gd:"transparent",
+                      border:`1px solid ${mode===m?T.green:T.b1}`,
+                      color:mode===m?T.green:T.muted,
+                      fontSize:9,letterSpacing:"0.2em",cursor:"pointer",borderRadius:3,textTransform:"uppercase",
+                    }}>
+                      <div>{m}</div>
+                      <div style={{fontSize:7,color:mode===m?T.green:T.dim,marginTop:3}}>
+                        {m===Enc.SVG?"vector · xml":"raster · lsb"}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+                <div style={{fontSize:8,color:T.dim,marginTop:6,lineHeight:1.7}}>
+                  {mode===Enc.SVG?"Carriers look like abstract art.":"Carriers look like pixel noise."}
+                  {" "}Both parties must use the same mode. The mode is shared via the URL.
+                </div>
               </div>
-              <div style={{fontSize:8,color:T.dim,marginTop:6,lineHeight:1.7,letterSpacing:"0.05em"}}>
-                {enc===Enc.SVG
-                  ?"Payload is hidden in SVG markup. Carriers look like abstract art."
-                  :"Payload is hidden in pixel noise. Carriers look like static."}
-                {" "}Both parties must use the same mode.
+            )}
+
+            {/* TTL hint (cosmetic, session expiry is handled locally) */}
+            {!isJoining&&(
+              <div>
+                <div style={{fontSize:8,color:T.muted,letterSpacing:"0.25em",textTransform:"uppercase",marginBottom:6}}>session TTL (hours)</div>
+                <input value={ttl} onChange={e=>setTtl(e.target.value)} placeholder="4"
+                  style={{width:"100%",background:T.raised,border:`1px solid ${T.b1}`,color:T.bright,padding:"9px 12px",fontSize:13,outline:"none",borderRadius:3}}
+                />
+                <div style={{fontSize:8,color:T.dim,marginTop:5,lineHeight:1.6}}>
+                  Messages persist in Supabase. TTL controls local session expiry only.
+                </div>
               </div>
-            </div>
+            )}
 
-            {/* TTL */}
-            <div>
-              <div style={{fontSize:8,color:T.muted,letterSpacing:"0.25em",textTransform:"uppercase",marginBottom:6}}>session TTL (hours)</div>
-              <input
-                value={ttl} onChange={e=>setTtl(e.target.value)}
-                placeholder="4"
-                style={{width:"100%",background:T.raised,border:`1px solid ${T.b1}`,color:T.bright,padding:"9px 12px",fontSize:13,outline:"none",borderRadius:3}}
-              />
-            </div>
-
-            {/* open */}
-            <button onClick={open} style={{
-              width:"100%",padding:"11px",marginTop:4,
+            <button onClick={join} style={{
+              width:"100%",padding:"11px",
               background:T.gd,border:`1px solid ${T.green}`,
               color:T.green,fontSize:10,letterSpacing:"0.25em",
               cursor:"pointer",borderRadius:3,textTransform:"uppercase",
-              transition:"all 0.15s",
             }}>
-              open channel →
+              {isJoining?"join room →":"create + open room →"}
             </button>
 
             <div style={{fontSize:8,color:T.dim,lineHeight:1.9,letterSpacing:"0.04em",borderTop:`1px solid ${T.b0}`,paddingTop:12}}>
-              Both parties must use the same passphrase and encoding mode.
-              Without the passphrase, any carrier is indistinguishable from noise.
-              When the session expires or is closed, the key is wiped and all payloads are cleared.
+              The passphrase never leaves your device. Supabase only stores encrypted carrier images —
+              without the passphrase they are indistinguishable from noise.
             </div>
           </div>
         </div>
@@ -587,48 +755,15 @@ function Setup({onOpen}){
 // ═══════════════════════════════════════════════════════════════════════════
 
 function App(){
-  const [ch,setCh]   = useState(null);
-  const [status,setSt] = useState(null);
+  const [session,setSession]=useState(null); // {roomId, mode, passphrase}
 
-  useEffect(()=>{
-    if(!ch)return;
-    setSt(ch.status);
-    const u=ch.on("*",()=>setSt(ch.status));
-    return()=>u();
-  },[ch]);
+  // On mount: if URL has room params, show join screen (Setup handles it)
+  // On leave: clear URL params, go back to setup
+  const join  = s=>setSession(s);
+  const leave = ()=>{clearUrlParams();setSession(null);};
 
-  const open  = c=>{setCh(c);setSt(c.status);};
-  const close = ()=>ch?.close();
-  const reset = ()=>{setCh(null);setSt(null);};
-
-  const terminal = status===CS.CLOSED||status===CS.EXPIRED;
-
-  if(!ch||terminal){
-    return(
-      <div style={{height:"100%",display:"flex",flexDirection:"column"}}>
-        {ch&&terminal&&(
-          <div style={{
-            background:status===CS.EXPIRED?T.rd:T.raised,
-            borderBottom:`1px solid ${status===CS.EXPIRED?T.red:T.b0}`,
-            padding:"9px 16px",display:"flex",alignItems:"center",gap:8,
-            fontSize:9,letterSpacing:"0.2em",flexShrink:0,
-          }}>
-            <span style={{color:status===CS.EXPIRED?T.red:T.muted,textTransform:"uppercase"}}>
-              channel {status} — key wiped
-            </span>
-            <button onClick={reset} style={{marginLeft:"auto",background:"transparent",border:`1px solid ${T.b1}`,color:T.sub,padding:"3px 10px",fontSize:8,letterSpacing:"0.15em",cursor:"pointer",borderRadius:2}}>
-              new channel
-            </button>
-          </div>
-        )}
-        <div style={{flex:1,overflow:"hidden"}}>
-          <Setup onOpen={open}/>
-        </div>
-      </div>
-    );
-  }
-
-  return <ChatView channel={ch} onClose={close}/>;
+  if(!session) return <Setup onJoin={join}/>;
+  return <ChatView {...session} onLeave={leave}/>;
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
