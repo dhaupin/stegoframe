@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>StegoFrame</title>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Syne:wght@600;700;800&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body {
+      background: #08090c;
+      color: #b8c4d0;
+      font-family: 'DM Mono', 'Fira Code', 'Courier New', monospace;
+      -webkit-font-smoothing: antialiased;
+    }
+    body::after {
+      content: '';
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 9999;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent, transparent 2px,
+        rgba(0,0,0,0.025) 2px, rgba(0,0,0,0.025) 4px
+      );
+    }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: #08090c; }
+    ::-webkit-scrollbar-thumb { background: #2c3240; border-radius: 2px; }
+    textarea, input { font-family: 'DM Mono', 'Fira Code', 'Courier New', monospace; }
+    @keyframes blink    { 0%,100%{opacity:1}  50%{opacity:0} }
+    @keyframes fadeUp   { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes pulse    { 0%,100%{opacity:1}  50%{opacity:0.35} }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // ── CODEC ────────────────────────────────────────────────────────────────
+
+    const _PBKDF2_ITER = 100_000, _SALT_B = 16, _IV_B = 12;
+    const _MAGIC = 0x534746, _VER = 0x02;
+
+    const Encoding     = Object.freeze({ SVG:"svg", LSB:"lsb", UNKNOWN:"unknown" });
+    const PayloadShape = Object.freeze({ TEXT:"text", STRUCTURED:"structured", UNKNOWN:"unknown" });
+    const MsgStatus    = Object.freeze({ PENDING:"pending", DECODED:"decoded", ENCODED:"encoded", FAILED:"failed", EXPIRED:"expired" });
+    const ChStatus     = Object.freeze({ OPEN:"open", DRAINING:"draining", CLOSED:"closed", EXPIRED:"expired" });
+
+    async function _deriveKey(pass, salt) {
+      const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(pass), {name:"PBKDF2"}, false, ["deriveKey"]);
+      return crypto.subtle.deriveKey({name:"PBKDF2",salt,iterations:_PBKDF2_ITER,hash:"SHA-256"}, km, {name:"AES-GCM",length:256}, false, ["encrypt","decrypt"]);
+    }
+    async function _enc(text, pass) {
+      const salt=crypto.getRandomValues(new Uint8Array(_SALT_B)), iv=crypto.getRandomValues(new Uint8Array(_IV_B));
+      const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv}, await _deriveKey(pass,salt), new TextEncoder().encode(text));
+      const out=new Uint8Array(_SALT_B+_IV_B+ct.byteLength); out.set(salt); out.set(iv,_SALT_B); out.set(new Uint8Array(ct),_SALT_B+_IV_B); return out;
+    }
+    async function _dec(data, pass) {
+      try { return new TextDecoder().decode(await crypto.subtle.decrypt({name:"AES-GCM",iv:data.slice(_SALT_B,_SALT_B+_IV_B)}, await _deriveKey(pass,data.slice(0,_SALT_B)), data.slice(_SALT_B+_IV_B))); }
+      catch { return null; }
+    }
+    function _pack(p) {
+      const b=new Uint8Array(8+p.length);
+      b[0]=(_MAGIC>>16)&0xFF; b[1]=(_MAGIC>>8)&0xFF; b[2]=_MAGIC&0xFF; b[3]=_VER;
+      const l=p.length; b[4]=(l>>24)&0xFF; b[5]=(l>>16)&0xFF; b[6]=(l>>8)&0xFF; b[7]=l&0xFF;
+      b.set(p,8); return b;
+    }
+    function _unpack(b) {
+      if(b.length<8) return null;
+      if(((b[0]<<16)|(b[1]<<8)|b[2])!==_MAGIC||b[3]!==_VER) return null;
+      const l=(b[4]<<24)|(b[5]<<16)|(b[6]<<8)|b[7];
+      return(l>0&&l<=b.length-8)?b.slice(8,8+l):null;
+    }
+    function _u8b64(b){let s="";for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s);}
+    function _b64u8(s){const b=atob(s),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a;}
+    function _bits2bytes(bits){const b=new Uint8Array(Math.floor(bits.length/8));for(let i=0;i<b.length;i++){let v=0;for(let j=0;j<8;j++)v=(v<<1)|bits[i*8+j];b[i]=v;}return b;}
+
+    function _lsbWrite(payload) {
+      const packed=_pack(payload), dim=Math.max(32,Math.ceil(Math.sqrt(packed.length*8)));
+      const canvas=document.createElement("canvas"); canvas.width=canvas.height=dim;
+      const ctx=canvas.getContext("2d"), img=ctx.createImageData(dim,dim);
+      crypto.getRandomValues(img.data);
+      for(let i=3;i<img.data.length;i+=4) img.data[i]=255;
+      for(let i=0;i<packed.length*8;i++){const bit=(packed[Math.floor(i/8)]>>(7-(i%8)))&1;img.data[i*4]=(img.data[i*4]&0xFE)|bit;}
+      ctx.putImageData(img,0,0); return canvas.toDataURL("image/png");
+    }
+    async function _lsbRead(dataUrl) {
+      return new Promise(resolve=>{
+        const img=new Image(); img.crossOrigin="anonymous";
+        img.onload=()=>{
+          const c=document.createElement("canvas"); c.width=img.width; c.height=img.height;
+          const ctx=c.getContext("2d"); ctx.drawImage(img,0,0);
+          const data=ctx.getImageData(0,0,img.width,img.height).data;
+          const hb=[]; for(let i=0;i<64;i++) hb.push(data[i*4]&1);
+          const hdr=_bits2bytes(hb); if(!_unpack(hdr)){resolve(null);return;}
+          const l=(hdr[4]<<24)|(hdr[5]<<16)|(hdr[6]<<8)|hdr[7], tb=(8+l)*8, ab=[];
+          for(let i=0;i<tb;i++) ab.push(data[i*4]&1);
+          resolve(_unpack(_bits2bytes(ab)));
+        };
+        img.onerror=()=>resolve(null); img.src=dataUrl;
+      });
+    }
+    function _svgWrite(payload) {
+      const b64=_u8b64(_pack(payload)), h=Math.floor(Math.random()*360), h2=(h+137)%360;
+      const els=Array.from({length:5},(_,i)=>`<circle cx="${(8+Math.random()*84).toFixed(1)}" cy="${(8+Math.random()*84).toFixed(1)}" r="${(2+Math.random()*8).toFixed(1)}" fill="hsla(${(h+i*43)%360},45%,60%,0.1)"/>`).join("");
+      const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100"><desc data-f="${_VER}" data-p="${b64}"/><defs><radialGradient id="g" cx="42%" cy="42%" r="62%"><stop offset="0%" stop-color="hsl(${h},50%,62%)"/><stop offset="100%" stop-color="hsl(${h2},42%,18%)"/></radialGradient></defs><rect width="100" height="100" fill="url(#g)"/>${els}</svg>`;
+      return "data:image/svg+xml;base64,"+btoa(unescape(encodeURIComponent(svg)));
+    }
+    function _svgRead(dataUrl) {
+      try {
+        const raw=decodeURIComponent(escape(atob(dataUrl.split(",")[1])));
+        const m=raw.match(/data-p="([A-Za-z0-9+/=]+)"/);
+        return m?_unpack(_b64u8(m[1])):null;
+      } catch { return null; }
+    }
+
+    const Codec = {
+      detectEncoding(u){if(!u)return Encoding.UNKNOWN;if(u.startsWith("data:image/svg"))return Encoding.SVG;return Encoding.LSB;},
+      async encode(text,pass,mode=Encoding.SVG){const e=await _enc(text,pass);return mode===Encoding.LSB?_lsbWrite(e):_svgWrite(e);},
+      async decode(url,pass){let raw=_svgRead(url);if(!raw)raw=await _lsbRead(url);if(!raw)return null;return _dec(raw,pass);}
+    };
+    const Detector = {
+      detect(t){
+        if(typeof t!=="string"||!t.trim()) return PayloadShape.UNKNOWN;
+        const s=t.trim();
+        if((s.startsWith("{")||s.startsWith("["))&&(s.endsWith("}")||s.endsWith("]"))){
+          try{JSON.parse(s);return PayloadShape.STRUCTURED;}catch{}
+        }
+        return PayloadShape.TEXT;
+      },
+      parse(t){const shape=this.detect(t);let value=t;if(shape===PayloadShape.STRUCTURED){try{value=JSON.parse(t.trim());}catch{}}return{shape,value,raw:t};}
+    };
+
+    // ── CHANNEL ──────────────────────────────────────────────────────────────
+
+    function makeChannel(pass, enc=Encoding.SVG, ttlMs=4*60*60*1000) {
+      const id=`ch_${Date.now().toString(36)}`;
+      let status=ChStatus.OPEN, _key=pass;
+      const messages=[], listeners=new Map(), expiresAt=Date.now()+ttlMs;
+      const on=(ev,fn)=>{if(!listeners.has(ev))listeners.set(ev,[]);listeners.get(ev).push(fn);return()=>{const a=listeners.get(ev)??[];listeners.set(ev,a.filter(f=>f!==fn));};};
+      const emit=(ev,d)=>{(listeners.get(ev)??[]).forEach(f=>f(d));(listeners.get("*")??[]).forEach(f=>f({event:ev,data:d}));};
+      function makeMsg(direction, msgStatus, encoding, shape, carrier, raw, value, error) {
+        const m={id:`msg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,5)}`,direction,status:msgStatus,encoding,shape,carrier,raw,value,channelId:id,error,createdAt:Date.now(),resolvedAt:Date.now()};
+        m.summary=()=>({id:m.id,direction:m.direction,status:m.status,encoding:m.encoding,shape:m.shape,channelId:id,error:m.error,createdAt:m.createdAt});
+        return m;
+      }
+      const ch={
+        id, expiresAt, messages, on,
+        get status(){return status;},
+        get encoding(){return enc;},
+        get _passphrase(){return _key;},
+        isOpen:()=>status===ChStatus.OPEN,
+        async send(text,mode){
+          if(!ch.isOpen()) throw new Error("channel closed");
+          const m=mode??enc, carrier=await Codec.encode(text,_key,m);
+          const msg=makeMsg("outbound",MsgStatus.ENCODED,m,Detector.detect(text),carrier,text,Detector.parse(text).value,null);
+          messages.push(msg); emit("message",msg.summary()); return msg;
+        },
+        async receive(dataUrl){
+          if(!ch.isOpen()) throw new Error("channel closed");
+          const raw=await Codec.decode(dataUrl,_key);
+          const msg=makeMsg("inbound",raw?MsgStatus.DECODED:MsgStatus.FAILED,Codec.detectEncoding(dataUrl),raw?Detector.detect(raw):PayloadShape.UNKNOWN,dataUrl,raw,raw?Detector.parse(raw).value:null,raw?null:"decryption failed — wrong key or no payload");
+          messages.push(msg); emit("message",msg.summary()); return msg;
+        },
+        close(){status=ChStatus.CLOSED;_key=null;messages.forEach(m=>m.raw=null);emit("closed",{channelId:id});}
+      };
+      setTimeout(()=>{if(status!==ChStatus.CLOSED){status=ChStatus.EXPIRED;_key=null;messages.forEach(m=>m.raw=null);emit("expired",{channelId:id});}},ttlMs);
+      return ch;
+    }
+
+    // ── TOKENS ───────────────────────────────────────────────────────────────
+
+    const T = {
+      bg:"#08090c", surface:"#0e1116", raised:"#13161c",
+      border:"#1e2229", borderHi:"#2c3240",
+      dim:"#3e4656", muted:"#5c6878", subtle:"#7d8fa0",
+      text:"#b8c4d0", bright:"#dce6f0", white:"#f0f5fa",
+      green:"#1dff8f", greenDim:"#0a3320",
+      red:"#ff3d5a",  redDim:"#2d0a10",
+      amber:"#ffb840", amberDim:"#2d1f00",
+      blue:"#4db8ff",  blueDim:"#001830",
+    };
+    const MONO = "'DM Mono','Fira Code','Courier New',monospace";
+    const DISP = "'Syne','Barlow Condensed',sans-serif";
+
+    // ── PRIMITIVES ────────────────────────────────────────────────────────────
+
+    const Label = ({children, color=T.muted}) => (
+      <div style={{fontSize:9,letterSpacing:"0.25em",color,fontFamily:MONO,textTransform:"uppercase",marginBottom:6}}>{children}</div>
+    );
+
+    const Tag = ({children, color=T.muted}) => (
+      <span style={{fontSize:8,letterSpacing:"0.2em",color,border:`1px solid ${color}`,padding:"1px 6px",borderRadius:1,fontFamily:MONO}}>{children}</span>
+    );
+
+    const StatusDot = ({status}) => {
+      const c = {
+        open:T.green, decoded:T.green, encoded:T.blue,
+        pending:T.amber, draining:T.amber,
+        failed:T.red, closed:T.muted, expired:T.muted,
+      }[status] ?? T.muted;
+      const anim = ["open","pending","draining"].includes(status) ? "pulse 2s infinite" : "none";
+      return <span style={{display:"inline-block",width:6,height:6,borderRadius:"50%",background:c,marginRight:6,flexShrink:0,animation:anim}}/>;
+    };
+
+    const Divider = ({label}) => (
+      <div style={{display:"flex",alignItems:"center",gap:10,margin:"16px 0"}}>
+        <div style={{flex:1,height:1,background:T.border}}/>
+        {label && <span style={{fontSize:8,letterSpacing:"0.3em",color:T.dim,fontFamily:MONO}}>{label}</span>}
+        <div style={{flex:1,height:1,background:T.border}}/>
+      </div>
+    );
+
+    const Btn = ({children, onClick, disabled, variant="default", small=false}) => {
+      const v = {
+        default:{bg:T.raised,   border:T.borderHi, color:T.text},
+        primary:{bg:T.greenDim, border:T.green,    color:T.green},
+        danger: {bg:T.redDim,   border:T.red,      color:T.red},
+        ghost:  {bg:"transparent", border:T.border, color:T.subtle},
+      }[variant] ?? {};
+      return (
+        <button onClick={onClick} disabled={disabled} style={{
+          background:disabled?T.surface:v.bg, border:`1px solid ${disabled?T.border:v.border}`,
+          color:disabled?T.muted:v.color, padding:small?"4px 10px":"8px 16px",
+          fontSize:small?8:9, letterSpacing:"0.2em", fontFamily:MONO,
+          cursor:disabled?"not-allowed":"pointer", borderRadius:2,
+          transition:"all 0.15s", textTransform:"uppercase", whiteSpace:"nowrap",
+        }}>{children}</button>
+      );
+    };
+
+    const FieldInput = ({value, onChange, placeholder, type="text", disabled, rows}) => {
+      const style={
+        width:"100%", background:T.surface, border:`1px solid ${T.border}`,
+        color:T.bright, padding:"9px 12px", fontSize:12, fontFamily:MONO,
+        outline:"none", borderRadius:2, letterSpacing:"0.02em", lineHeight:1.6,
+        transition:"border-color 0.15s", resize:rows?"vertical":undefined,
+      };
+      return rows
+        ? <textarea value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} rows={rows} disabled={disabled} style={style}/>
+        : <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} disabled={disabled} style={style}/>;
+    };
+
+    const Panel = ({title, subtitle, children, accent, style={}}) => (
+      <div style={{background:T.surface,border:`1px solid ${accent||T.border}`,borderRadius:3,overflow:"hidden",...style}}>
+        {(title||subtitle) && (
+          <div style={{padding:"12px 16px",borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <div>
+              <div style={{fontSize:10,letterSpacing:"0.3em",color:accent||T.subtle,fontFamily:MONO,textTransform:"uppercase"}}>{title}</div>
+              {subtitle && <div style={{fontSize:8,color:T.muted,marginTop:2,letterSpacing:"0.15em"}}>{subtitle}</div>}
+            </div>
+          </div>
+        )}
+        <div style={{padding:16}}>{children}</div>
+      </div>
+    );
+
+    // ── CARRIER DISPLAY ───────────────────────────────────────────────────────
+
+    function CarrierDisplay({carrier, encoding, label}) {
+      const [copied, setCopied] = useState(false);
+      if (!carrier) return null;
+      const isSvg = encoding===Encoding.SVG || carrier.startsWith("data:image/svg");
+      const copy = () => {
+        const b64=carrier.split(",")[1];
+        if (navigator.clipboard) navigator.clipboard.writeText(b64).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);});
+      };
+      const download = () => {
+        const a=document.createElement("a"); a.href=carrier;
+        a.download=`carrier.${isSvg?"svg":"png"}`; a.click();
+      };
+      return (
+        <div style={{animation:"fadeUp 0.3s ease"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+            <Label>{label||"carrier"}</Label>
+            <div style={{display:"flex",gap:6}}>
+              <Btn small variant="ghost" onClick={copy}>{copied?"copied ✓":"copy b64"}</Btn>
+              <Btn small variant="ghost" onClick={download}>↓ save</Btn>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+            <div style={{flexShrink:0,border:`1px solid ${T.borderHi}`,borderRadius:2,overflow:"hidden",width:88,height:88,background:T.raised}}>
+              <img src={carrier} style={{width:"100%",height:"100%",imageRendering:isSvg?"auto":"pixelated",display:"block"}} alt="carrier"/>
+            </div>
+            <div style={{flex:1,display:"flex",flexDirection:"column",gap:6,paddingTop:2}}>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                <Tag color={isSvg?T.blue:T.amber}>{isSvg?"SVG VECTOR":"LSB RASTER"}</Tag>
+                <Tag color={T.muted}>{carrier.length.toLocaleString()} chars</Tag>
+              </div>
+              <div style={{fontSize:9,color:T.subtle,lineHeight:1.6}}>
+                {isSvg?"payload hidden in SVG <desc> attribute":"payload hidden in pixel LSB bits"}
+              </div>
+              <div style={{fontSize:8,color:T.dim,fontFamily:MONO,wordBreak:"break-all",maxHeight:30,overflow:"hidden",lineHeight:1.4}}>
+                {carrier.split(",")[1]?.slice(0,72)}…
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── MESSAGE ROW ───────────────────────────────────────────────────────────
+
+    function MessageRow({msg}) {
+      const [revealed, setRevealed] = useState(false);
+      const sc = {
+        [MsgStatus.DECODED]:T.green, [MsgStatus.ENCODED]:T.blue,
+        [MsgStatus.FAILED]:T.red,   [MsgStatus.EXPIRED]:T.muted,
+        [MsgStatus.PENDING]:T.amber,
+      }[msg.status] ?? T.muted;
+
+      return (
+        <div style={{borderLeft:`2px solid ${sc}`,padding:"10px 12px",background:T.raised,borderRadius:"0 2px 2px 0",animation:"fadeUp 0.25s ease",marginBottom:6}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:msg.status===MsgStatus.DECODED||msg.status===MsgStatus.FAILED?8:0}}>
+            <StatusDot status={msg.status}/>
+            <span style={{fontSize:8,letterSpacing:"0.2em",color:sc,textTransform:"uppercase"}}>{msg.status}</span>
+            <span style={{fontSize:8,color:T.dim,marginLeft:"auto"}}>{msg.direction==="inbound"?"← IN":"→ OUT"}</span>
+            <Tag color={T.muted}>{(msg.encoding||"?").toUpperCase()}</Tag>
+          </div>
+
+          {msg.status===MsgStatus.DECODED && (
+            <div>
+              {!revealed
+                ? <Btn small variant="ghost" onClick={()=>setRevealed(true)}>reveal payload</Btn>
+                : <div style={{fontSize:11,color:T.bright,background:T.surface,padding:"8px 10px",borderRadius:2,wordBreak:"break-word",lineHeight:1.7,whiteSpace:"pre-wrap"}}>
+                    {typeof msg.value==="object" ? JSON.stringify(msg.value,null,2) : msg.value}
+                  </div>
+              }
+            </div>
+          )}
+
+          {msg.status===MsgStatus.FAILED && (
+            <div style={{fontSize:9,color:T.red,lineHeight:1.5}}>{msg.error}</div>
+          )}
+
+          {msg.carrier && (msg.status===MsgStatus.DECODED||msg.status===MsgStatus.ENCODED) && (
+            <div style={{marginTop:10}}>
+              <CarrierDisplay carrier={msg.carrier} encoding={msg.encoding}/>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── CHANNEL BAR ───────────────────────────────────────────────────────────
+
+    function ChannelBar({channel, onClose}) {
+      const [now, setNow] = useState(Date.now());
+      useEffect(()=>{const t=setInterval(()=>setNow(Date.now()),1000);return()=>clearInterval(t);},[]);
+      const rem = Math.max(0, channel.expiresAt - now);
+      const hh=Math.floor(rem/3600000), mm=Math.floor((rem%3600000)/60000), ss=Math.floor((rem%60000)/1000);
+      const ttl=`${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+      const chStatus=channel.status;
+      const sc={[ChStatus.OPEN]:T.green,[ChStatus.DRAINING]:T.amber,[ChStatus.CLOSED]:T.muted,[ChStatus.EXPIRED]:T.muted}[chStatus]??T.muted;
+      return (
+        <div style={{display:"flex",alignItems:"center",gap:12,padding:"8px 20px",background:T.raised,borderBottom:`1px solid ${T.border}`,fontSize:9,fontFamily:MONO,letterSpacing:"0.15em",flexWrap:"wrap"}}>
+          <StatusDot status={chStatus}/>
+          <span style={{color:sc,textTransform:"uppercase"}}>{chStatus}</span>
+          <span style={{color:T.dim}}>·</span>
+          <span style={{color:T.muted}}>ch/{channel.id.slice(-8)}</span>
+          <span style={{color:T.dim}}>·</span>
+          <span style={{color:T.subtle}}>{channel.encoding.toUpperCase()}</span>
+          <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:12}}>
+            <span style={{color:rem<300000?T.red:T.muted}}>TTL {ttl}</span>
+            {chStatus===ChStatus.OPEN && <Btn small variant="danger" onClick={onClose}>close channel</Btn>}
+          </div>
+        </div>
+      );
+    }
+
+    // ── COMPOSE ───────────────────────────────────────────────────────────────
+
+    function ComposeView({channel, onSent}) {
+      const [text, setText] = useState("");
+      const [mode, setMode] = useState(channel?.encoding??Encoding.SVG);
+      const [busy, setBusy] = useState(false);
+      const [lastMsg, setLastMsg] = useState(null);
+
+      const send = async () => {
+        if (!text.trim()||!channel?.isOpen()||busy) return;
+        setBusy(true);
+        try { const msg=await channel.send(text.trim(),mode); setLastMsg(msg); setText(""); onSent?.(msg); }
+        finally { setBusy(false); }
+      };
+
+      return (
+        <Panel title="02 · Compose" subtitle="encode payload → carrier" accent={T.blue}>
+          <div style={{marginBottom:12}}>
+            <Label>encoding mode</Label>
+            <div style={{display:"flex",gap:6,marginBottom:6}}>
+              {[Encoding.SVG,Encoding.LSB].map(m=>(
+                <button key={m} onClick={()=>setMode(m)} style={{
+                  flex:1, background:mode===m?T.blueDim:"transparent",
+                  border:`1px solid ${mode===m?T.blue:T.border}`,
+                  color:mode===m?T.blue:T.muted,
+                  padding:"6px 0", fontSize:8, letterSpacing:"0.2em",
+                  cursor:"pointer", borderRadius:2, fontFamily:MONO, textTransform:"uppercase",
+                }}>
+                  <div>{m}</div>
+                  <div style={{fontSize:7,color:mode===m?T.blue:T.dim,marginTop:2}}>{m===Encoding.SVG?"vector xml":"pixel lsb"}</div>
+                </button>
+              ))}
+            </div>
+            <div style={{fontSize:8,color:T.dim,letterSpacing:"0.1em"}}>
+              {mode===Encoding.SVG?"payload embedded in SVG markup — looks like abstract art":"payload encoded in pixel noise — looks like static"}
+            </div>
+          </div>
+
+          <div style={{marginBottom:12}}>
+            <Label>payload</Label>
+            <textarea
+              value={text} onChange={e=>setText(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter"&&(e.metaKey||e.ctrlKey))send();}}
+              placeholder="type a message or paste JSON..." rows={5}
+              disabled={!channel?.isOpen()}
+              style={{width:"100%",background:T.surface,border:`1px solid ${T.border}`,color:T.bright,padding:"9px 12px",fontSize:12,fontFamily:MONO,outline:"none",borderRadius:2,lineHeight:1.7,resize:"vertical"}}
+            />
+            <div style={{fontSize:8,color:T.dim,marginTop:4}}>⌘+Enter or Ctrl+Enter to send</div>
+          </div>
+
+          <Btn variant="primary" onClick={send} disabled={!text.trim()||!channel?.isOpen()||busy}>
+            {busy?"encoding…":"encode + send →"}
+          </Btn>
+
+          {lastMsg && <>
+            <Divider label="last outbound"/>
+            <MessageRow msg={lastMsg}/>
+          </>}
+        </Panel>
+      );
+    }
+
+    // ── RECEIVE ───────────────────────────────────────────────────────────────
+
+    function ReceiveView({channel}) {
+      const [messages, setMessages] = useState([]);
+      const [busy, setBusy]         = useState(false);
+      const [dragOver, setDragOver] = useState(false);
+      const [b64Input, setB64Input] = useState("");
+      const fileRef = useRef();
+
+      const process = async (dataUrl) => {
+        if (!channel?.isOpen()||busy||!dataUrl) return;
+        setBusy(true);
+        try { const msg=await channel.receive(dataUrl); setMessages(m=>[msg,...m].slice(0,30)); }
+        finally { setBusy(false); }
+      };
+
+      const fromFile = (file) => {
+        const r=new FileReader(); r.onload=e=>process(e.target.result); r.readAsDataURL(file);
+      };
+
+      const onDrop = e => {
+        e.preventDefault(); setDragOver(false);
+        const f=e.dataTransfer.files[0]; if(f) fromFile(f);
+      };
+
+      const onPaste = useCallback(e => {
+        const items=Array.from(e.clipboardData?.items??[]);
+        const img=items.find(i=>i.type.startsWith("image/"));
+        if(img){fromFile(img.getAsFile());return;}
+        const txt=items.find(i=>i.kind==="string");
+        if(txt) txt.getAsString(s=>{
+          const t=s.trim();
+          if(t.startsWith("data:")) process(t);
+          else{try{atob(t);process("data:image/png;base64,"+t);}catch{}}
+        });
+      },[channel]);
+
+      useEffect(()=>{document.addEventListener("paste",onPaste);return()=>document.removeEventListener("paste",onPaste);},[onPaste]);
+
+      const submitB64 = () => {
+        const s=b64Input.trim(); if(!s) return;
+        if(s.startsWith("data:")) process(s);
+        else { try{atob(s);process("data:image/png;base64,"+s);}catch{process("data:image/svg+xml;base64,"+s);} }
+        setB64Input("");
+      };
+
+      return (
+        <Panel title="03 · Receive" subtitle="decode carrier → payload" accent={T.green}>
+          <div
+            onDrop={onDrop} onDragOver={e=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)}
+            onClick={()=>fileRef.current?.click()}
+            style={{border:`1px dashed ${dragOver?T.green:T.borderHi}`,borderRadius:2,padding:"20px 16px",textAlign:"center",background:dragOver?T.greenDim:T.raised,transition:"all 0.15s",marginBottom:12,cursor:"pointer"}}
+          >
+            <input ref={fileRef} type="file" accept="image/*,.svg" style={{display:"none"}} onChange={e=>{if(e.target.files[0])fromFile(e.target.files[0]);}}/>
+            <div style={{fontSize:10,color:dragOver?T.green:T.subtle,letterSpacing:"0.2em",marginBottom:4}}>
+              {busy?"decoding…":"drop · click · or paste anywhere"}
+            </div>
+            <div style={{fontSize:8,color:T.dim,letterSpacing:"0.1em"}}>accepts image file, data URL, or raw base64</div>
+          </div>
+
+          <div style={{marginBottom:4}}>
+            <Label>paste base64 or data URL</Label>
+            <div style={{display:"flex",gap:6}}>
+              <input
+                value={b64Input} onChange={e=>setB64Input(e.target.value)}
+                onKeyDown={e=>{if(e.key==="Enter")submitB64();}}
+                placeholder="data:image/... or bare base64…"
+                style={{flex:1,background:T.surface,border:`1px solid ${T.border}`,color:T.bright,padding:"8px 12px",fontSize:11,fontFamily:MONO,outline:"none",borderRadius:2}}
+              />
+              <Btn variant="ghost" onClick={submitB64}>→</Btn>
+            </div>
+          </div>
+
+          {messages.length>0 && <>
+            <Divider label={`${messages.length} received`}/>
+            <div style={{maxHeight:500,overflowY:"auto",display:"flex",flexDirection:"column",gap:6}}>
+              {messages.map(m=><MessageRow key={m.id} msg={m}/>)}
+            </div>
+          </>}
+
+          {messages.length===0 && (
+            <div style={{textAlign:"center",color:T.dim,fontSize:9,padding:"24px 0",letterSpacing:"0.2em"}}>
+              no transmissions received
+            </div>
+          )}
+        </Panel>
+      );
+    }
+
+    // ── SETUP ─────────────────────────────────────────────────────────────────
+
+    function ChannelSetup({onOpen}) {
+      const [pass, setPass]   = useState("");
+      const [enc, setEnc]     = useState(Encoding.SVG);
+      const [ttl, setTtl]     = useState("4");
+      const [error, setError] = useState("");
+      const [show, setShow]   = useState(false);
+
+      const open = () => {
+        if(!pass.trim()){setError("passphrase required");return;}
+        if(pass.trim().length<4){setError("passphrase must be at least 4 characters");return;}
+        const ttlMs=Math.max(0.1,parseFloat(ttl)||4)*60*60*1000;
+        onOpen(makeChannel(pass.trim(),enc,ttlMs));
+      };
+
+      return (
+        <div style={{minHeight:"100vh",background:T.bg,display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
+          <div style={{width:"100%",maxWidth:420}}>
+            <div style={{textAlign:"center",marginBottom:40}}>
+              <div style={{fontFamily:DISP,fontSize:32,fontWeight:800,color:T.white,letterSpacing:"0.08em"}}>
+                STEGO<span style={{color:T.green}}>FRAME</span>
+              </div>
+              <div style={{fontSize:8,color:T.muted,letterSpacing:"0.4em",marginTop:6}}>STEGANOGRAPHIC TRANSPORT MIDDLEWARE</div>
+            </div>
+
+            <Panel title="01 · Open Channel" subtitle="passphrase establishes the shared channel key">
+              <div style={{marginBottom:14}}>
+                <Label>passphrase</Label>
+                <div style={{position:"relative"}}>
+                  <input
+                    type={show?"text":"password"} value={pass}
+                    onChange={e=>{setPass(e.target.value);setError("");}}
+                    onKeyDown={e=>{if(e.key==="Enter")open();}}
+                    placeholder="shared secret…"
+                    style={{width:"100%",background:T.surface,border:`1px solid ${error?T.red:T.border}`,color:T.bright,padding:"9px 40px 9px 12px",fontSize:12,fontFamily:MONO,outline:"none",borderRadius:2}}
+                  />
+                  <button onClick={()=>setShow(v=>!v)} style={{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:T.muted,cursor:"pointer",fontSize:11,fontFamily:MONO}}>
+                    {show?"hide":"show"}
+                  </button>
+                </div>
+                {error && <div style={{fontSize:9,color:T.red,marginTop:5,letterSpacing:"0.05em"}}>{error}</div>}
+              </div>
+
+              <div style={{marginBottom:14}}>
+                <Label>encoding mode</Label>
+                <div style={{display:"flex",gap:6}}>
+                  {[Encoding.SVG,Encoding.LSB].map(m=>(
+                    <button key={m} onClick={()=>setEnc(m)} style={{
+                      flex:1, background:enc===m?T.greenDim:"transparent",
+                      border:`1px solid ${enc===m?T.green:T.border}`,
+                      color:enc===m?T.green:T.muted,
+                      padding:"8px 0", fontSize:8, letterSpacing:"0.25em",
+                      cursor:"pointer", borderRadius:2, fontFamily:MONO, textTransform:"uppercase",
+                    }}>
+                      <div>{m}</div>
+                      <div style={{fontSize:7,color:enc===m?T.green:T.dim,marginTop:2}}>{m===Encoding.SVG?"vector xml":"pixel lsb"}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{marginBottom:20}}>
+                <Label>session TTL (hours)</Label>
+                <input
+                  value={ttl} onChange={e=>setTtl(e.target.value)}
+                  placeholder="4"
+                  style={{width:"100%",background:T.surface,border:`1px solid ${T.border}`,color:T.bright,padding:"9px 12px",fontSize:12,fontFamily:MONO,outline:"none",borderRadius:2}}
+                />
+                <div style={{fontSize:8,color:T.dim,marginTop:5,lineHeight:1.6}}>
+                  channel expires after this window — key wiped, messages cleared
+                </div>
+              </div>
+
+              <button onClick={open} style={{
+                width:"100%", background:T.greenDim, border:`1px solid ${T.green}`,
+                color:T.green, padding:"11px", fontSize:10, letterSpacing:"0.25em",
+                cursor:"pointer", borderRadius:2, fontFamily:MONO, textTransform:"uppercase",
+              }}>
+                open channel →
+              </button>
+
+              <div style={{marginTop:16,fontSize:8,color:T.dim,lineHeight:1.9,letterSpacing:"0.05em"}}>
+                Both parties must use the same passphrase. Without it, any carrier image is indistinguishable from noise.
+              </div>
+            </Panel>
+          </div>
+        </div>
+      );
+    }
+
+    // ── APP ───────────────────────────────────────────────────────────────────
+
+    function App() {
+      const [channel, setChannel]       = useState(null);
+      const [chStatus, setChStatus]     = useState(null);
+      const [msgCount, setMsgCount]     = useState(0);
+      const [dismissed, setDismissed]   = useState(false);
+
+      useEffect(()=>{
+        if(!channel) return;
+        setChStatus(channel.status);
+        const unsub=channel.on("*",({event})=>{
+          setChStatus(channel.status);
+          if(event==="message") setMsgCount(n=>n+1);
+        });
+        return()=>unsub();
+      },[channel]);
+
+      const openChannel = ch => { setChannel(ch); setChStatus(ch.status); setMsgCount(0); setDismissed(false); };
+      const closeChannel = () => channel?.close();
+      const reset = () => { setChannel(null); setChStatus(null); setMsgCount(0); setDismissed(false); };
+
+      const isTerminal = chStatus===ChStatus.CLOSED||chStatus===ChStatus.EXPIRED;
+
+      if (!channel || (isTerminal && dismissed)) {
+        return (
+          <div>
+            {channel && isTerminal && !dismissed && (
+              <div style={{position:"fixed",top:0,left:0,right:0,zIndex:100,background:chStatus===ChStatus.EXPIRED?T.redDim:T.raised,borderBottom:`1px solid ${chStatus===ChStatus.EXPIRED?T.red:T.border}`,padding:"9px 20px",display:"flex",alignItems:"center",gap:10,fontSize:9,letterSpacing:"0.2em"}}>
+                <StatusDot status={chStatus}/>
+                <span style={{color:chStatus===ChStatus.EXPIRED?T.red:T.muted,textTransform:"uppercase"}}>channel {chStatus} — key wiped</span>
+                <Btn small variant="ghost" onClick={reset} style={{marginLeft:"auto"}}>open new channel</Btn>
+              </div>
+            )}
+            <ChannelSetup onOpen={openChannel}/>
+          </div>
+        );
+      }
+
+      if (isTerminal) {
+        return (
+          <div style={{minHeight:"100vh",background:T.bg,display:"flex",flexDirection:"column"}}>
+            <div style={{background:chStatus===ChStatus.EXPIRED?T.redDim:T.raised,borderBottom:`1px solid ${chStatus===ChStatus.EXPIRED?T.red:T.border}`,padding:"12px 20px",display:"flex",alignItems:"center",gap:10,fontSize:9,letterSpacing:"0.2em"}}>
+              <StatusDot status={chStatus}/>
+              <span style={{color:chStatus===ChStatus.EXPIRED?T.red:T.muted,textTransform:"uppercase"}}>channel {chStatus} — key wiped — all payloads cleared</span>
+              <Btn small variant="primary" onClick={reset} style={{marginLeft:"auto"}}>open new channel</Btn>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div style={{minHeight:"100vh",background:T.bg,display:"flex",flexDirection:"column"}}>
+          {/* top bar */}
+          <div style={{borderBottom:`1px solid ${T.border}`,padding:"10px 20px",display:"flex",alignItems:"center",gap:16,background:T.raised}}>
+            <div style={{fontFamily:DISP,fontSize:17,fontWeight:800,color:T.white,letterSpacing:"0.08em"}}>
+              STEGO<span style={{color:T.green}}>FRAME</span>
+            </div>
+            <div style={{width:1,height:16,background:T.border}}/>
+            <div style={{fontSize:8,color:T.dim,letterSpacing:"0.3em"}}>MIDDLEWARE LAYER</div>
+            <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:8}}>
+              <Tag color={T.muted}>{msgCount} tx</Tag>
+            </div>
+          </div>
+
+          {/* channel bar */}
+          <ChannelBar channel={channel} onClose={closeChannel}/>
+
+          {/* panels */}
+          <div style={{flex:1,padding:20,display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:16,alignItems:"start",maxWidth:980,margin:"0 auto",width:"100%"}}>
+            <ComposeView channel={channel} onSent={()=>setMsgCount(n=>n+1)}/>
+            <ReceiveView channel={channel}/>
+          </div>
+
+          {/* footer */}
+          <div style={{borderTop:`1px solid ${T.border}`,padding:"8px 20px",display:"flex",gap:16,fontSize:8,color:T.dim,letterSpacing:"0.15em",flexWrap:"wrap"}}>
+            <span>AES-GCM-256 · PBKDF2-SHA256 · {channel.encoding.toUpperCase()}</span>
+            <span style={{marginLeft:"auto"}}>wrong key = noise · no key = just an image</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ── MOUNT ─────────────────────────────────────────────────────────────────
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App/>);
+  </script>
+</body>
+</html>
