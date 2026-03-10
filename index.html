@@ -183,7 +183,7 @@ function dbSubscribe(roomId, onInsert, onDelete) {
     .on("postgres_changes", {
       event: "DELETE", schema: "public", table: "messages",
       filter: `room_id=eq.${roomId}`,
-    }, payload => onDelete(payload.old?.id))
+    }, payload => { const id=payload.old?.id; if(id) onDelete(id); })
     .subscribe();
   return () => sb.removeChannel(ch);
 }
@@ -360,6 +360,16 @@ function ChatView({roomId, mode, passphrase, onLeave}){
   // Tab-switch guard: track when tab became visible to ignore stale sends
   const lastVisibleRef = useRef(Date.now());
 
+  // ── reload (manual refresh without leaving room) ────────────────────────────
+  const reload=useCallback(()=>{
+    setLoading(true);setError(null);
+    dbLoad(roomId).then(async rows=>{
+      const decoded=await Promise.all(rows.map(r=>decodeRow(r,passphrase,mode)));
+      setMsgs(decoded.filter(Boolean));
+      setLoading(false);
+    }).catch(e=>{setError("Failed to load: "+e.message);setLoading(false);});
+  },[roomId,passphrase,mode]);
+
   // ── load history ──────────────────────────────────────────────────────────
   useEffect(()=>{
     setLoading(true);setError(null);
@@ -513,19 +523,37 @@ function ChatView({roomId, mode, passphrase, onLeave}){
     <div style={{height:"100%",display:"flex",flexDirection:"column",background:T.bg}}>
 
       {/* ── header ── */}
-      <div style={{background:T.raised,borderBottom:`1px solid ${T.b0}`,padding:"10px 16px",display:"flex",alignItems:"center",gap:10,flexShrink:0}}>
-        <div style={{fontFamily:DISP,fontSize:15,fontWeight:800,color:T.white,letterSpacing:"0.06em"}}>
-          STEGO<span style={{color:T.green}}>FRAME</span>
+      <div style={{background:T.raised,borderBottom:`1px solid ${T.b0}`,padding:"8px 12px",display:"flex",alignItems:"center",gap:8,flexShrink:0,minWidth:0}}>
+        {/* wordmark — hidden on very small screens via opacity trick */}
+        <div style={{fontFamily:DISP,fontSize:14,fontWeight:800,color:T.white,letterSpacing:"0.05em",flexShrink:0}}>
+          SF<span style={{color:T.green}}>·</span>
         </div>
-        <div style={{width:1,height:14,background:T.b1}}/>
-        <span style={{fontSize:9,color:T.muted,letterSpacing:"0.2em",fontFamily:MONO}}>#{roomId}</span>
-        <span style={{fontSize:8,color:T.dim,letterSpacing:"0.2em"}}>{mode.toUpperCase()}</span>
-        {/* connection dot */}
+        {/* room + mode + conn */}
+        <span style={{fontSize:9,color:T.muted,letterSpacing:"0.15em",fontFamily:MONO,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",minWidth:0}}>#{roomId}</span>
+        <span style={{fontSize:8,color:T.dim,letterSpacing:"0.15em",flexShrink:0}}>{mode.toUpperCase()}</span>
         <span title={connState} style={{width:5,height:5,borderRadius:"50%",background:connColor,display:"inline-block",
           animation:connState==="connecting"?"pulse 1s infinite":"none",flexShrink:0}}/>
-        <div style={{marginLeft:"auto",display:"flex",gap:8}}>
-          <Btn small ghost onClick={shareUrl}>share room</Btn>
-          <Btn small danger onClick={onLeave}>leave</Btn>
+        {/* actions — right side, icon-style buttons to save space */}
+        <div style={{marginLeft:"auto",display:"flex",gap:6,flexShrink:0}}>
+          {/* refresh */}
+          <button onClick={reload} title="reload messages" style={{
+            background:"transparent",border:`1px solid ${T.b1}`,color:T.sub,
+            width:30,height:30,cursor:"pointer",borderRadius:2,fontSize:13,
+            display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,
+            animation:loading?"spin 0.8s linear infinite":"none",
+          }}>↻</button>
+          {/* share */}
+          <button onClick={shareUrl} title="copy room url" style={{
+            background:"transparent",border:`1px solid ${T.b1}`,color:T.sub,
+            width:30,height:30,cursor:"pointer",borderRadius:2,fontSize:13,
+            display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,
+          }}>⎗</button>
+          {/* leave */}
+          <button onClick={onLeave} title="leave room" style={{
+            background:T.rd,border:`1px solid ${T.red}`,color:T.red,
+            width:30,height:30,cursor:"pointer",borderRadius:2,fontSize:13,
+            display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,
+          }}>⏻</button>
         </div>
       </div>
 
