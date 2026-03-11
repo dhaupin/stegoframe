@@ -166,7 +166,7 @@ alter table messages replica identity full;
 
 ### 4. (Optional) Auto-purge expired rooms with pg_cron
 
-Supabase includes [pg_cron](https://supabase.com/docs/guides/database/extensions/pgcron). Enable it and add a daily cleanup job:
+Supabase includes [pg_cron](https://supabase.com/docs/guides/cron). Enable it and add a daily cleanup job:
 
 ```sql
 -- Enable extension (if not already enabled)
