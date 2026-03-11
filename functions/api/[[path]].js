@@ -1,5 +1,19 @@
 export async function onRequest(context) {
   const { request, env } = context;
+
+  // HANDLE CORS PREFLIGHT
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, apikey, x-client-info",
+        "Access-Control-Max-Age": "86400",
+      },
+    });
+  }
+
   const url = new URL(request.url);
   
   // 1. Map the internal path (e.g., /api/rest/v1/messages -> /rest/v1/messages)
