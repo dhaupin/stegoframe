@@ -12,9 +12,8 @@
     All crypto is client-side (Web Crypto API). Supabase is the transport bus.
     The server never sees plaintext — only encrypted carrier image data URLs.
 
-    Load order matters here: React and Babel must be available before the
-    <script type="text/babel"> block is parsed. Supabase must load before
-    the app code references `supabase.createClient`.
+    Load order: React → ReactDOM → Babel → Supabase, all before the
+    <script type="text/babel"> block executes.
   -->
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
@@ -27,55 +26,29 @@
 
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-    /* Full-height layout — the chat thread uses flex to fill remaining space */
     html, body, #root { height: 100%; overflow: hidden; }
-
-    body {
-      background: #08090c;
-      color: #b8c4d0;
-      font-family: 'DM Mono', 'Fira Code', 'Courier New', monospace;
-      -webkit-font-smoothing: antialiased;
-    }
-
-    /* Thin scrollbar — cosmetic only, does not affect scroll behaviour */
+    body { background: #08090c; color: #b8c4d0; font-family: 'DM Mono','Fira Code','Courier New',monospace; -webkit-font-smoothing: antialiased; }
     ::-webkit-scrollbar { width: 3px; height: 3px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: #2c3240; border-radius: 2px; }
-
-    /* Ensure form elements inherit the monospace stack */
     textarea, input, button { font-family: inherit; }
-
-    /* ── Keyframe animations used throughout the UI ── */
     @keyframes fadeUp { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
-    @keyframes pulse  { 0%,100%{opacity:1} 50%{opacity:0.3} }  /* connection status dot */
-    @keyframes spin   { to{transform:rotate(360deg)} }           /* reload button + loading spinner */
+    @keyframes pulse  { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    @keyframes spin   { to{transform:rotate(360deg)} }
   </style>
 </head>
 <body>
 <div id="root"></div>
 
-<!-- type="text/babel" tells Babel standalone to transpile JSX before execution -->
 <script type="text/babel">
 const { useState, useEffect, useRef, useCallback } = React;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SUPABASE CLIENT
 // ──────────────────────────────────────────────────────────────────────────────
-// SUPA_URL and SUPA_ANON are injected at request time by _worker.js, which
-// substitutes the {{SUPA_URL}} and {{SUPA_ANON}} placeholders with values from
-// Cloudflare Pages environment variables before serving this file.
-//
-// @why  The anon key is intentionally public by Supabase's design — it only
-//       grants what RLS policies allow. We keep it out of source control via
-//       env vars, but it is NOT a secret in the cryptographic sense. The real
-//       secret is the passphrase, which never leaves the client at all.
-//
-// @why  Direct connection (no proxy) — Supabase Realtime uses WebSockets that
-//       connect from the browser directly to Supabase's servers. Proxying
-//       WebSockets through Cloudflare Pages Functions is not supported (Pages
-//       Functions cannot upgrade connections). Attempting it breaks Realtime
-//       entirely. The direct connection is correct and intended.
+// {{SUPA_URL}} and {{SUPA_ANON}} are substituted at request time by _worker.js
+// from Cloudflare Pages environment variables. Use the publishable (anon) key —
+// never the secret key. The passphrase is the real secret; it never leaves the client.
 // ══════════════════════════════════════════════════════════════════════════════
 
 const SUPA_URL  = "{{SUPA_URL}}";
@@ -84,372 +57,330 @@ const sb = supabase.createClient(SUPA_URL, SUPA_ANON);
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SESSION IDENTITY
+// LIMITS & CONSTANTS
 // ──────────────────────────────────────────────────────────────────────────────
-// Each browser tab gets a random UUID on first open, stored in sessionStorage.
-// This is attached to every outbound message as sender_id and used to determine
-// "you" vs "them" when rendering bubbles.
+// Client-side enforcement. The worker and Supabase RLS are the authoritative
+// backstop against abuse — these provide fast feedback and reduce wasted I/O.
+// ══════════════════════════════════════════════════════════════════════════════
+
+const ROOM_TTL_MS       = 7 * 24 * 60 * 60 * 1000; // 7-day maximum room lifetime
+const MAX_MSG_CHARS     = 2000;   // plaintext character cap per message
+const MAX_CARRIER_BYTES = 512000; // ~500KB carrier data URL size cap
+const MAX_ROOM_MESSAGES = 500;    // refuse to send when room hits this count
+const SEND_THROTTLE_MS  = 1000;   // minimum gap between sends (1 msg/sec)
+const SEND_DEBOUNCE_MS  = 300;    // debounce delay on send action
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SESSION IDENTITY & USERNAME
+// ──────────────────────────────────────────────────────────────────────────────
+// SESSION_ID — random UUID per tab in sessionStorage.
+//   Tab-scoped: a new tab is a new participant. Prevents sibling tabs from
+//   appearing as "you" in each other's message thread.
 //
-// @why  sessionStorage (not localStorage) — intentionally scoped to the tab
-//       lifetime. A new tab = a new participant identity. This prevents two
-//       open tabs from mistakenly sharing an identity, which would cause
-//       messages from the other tab to appear as "yours".
+// Username — stored in localStorage (survives tab close), editable in-room.
+//   Falls back to "anon-XXXXXX" (last 6 hex chars of session UUID).
+//   Stored as display_name in Supabase (plaintext, not sensitive).
 // ══════════════════════════════════════════════════════════════════════════════
 
 function getSessionId() {
   let id = sessionStorage.getItem("sf_sid");
-  if (!id) {
-    id = crypto.randomUUID();
-    sessionStorage.setItem("sf_sid", id);
-  }
+  if (!id) { id = crypto.randomUUID(); sessionStorage.setItem("sf_sid", id); }
   return id;
 }
-
-// MODULE-LEVEL constant — resolved once at load time, stable for the tab's life
 const SESSION_ID = getSessionId();
+
+function defaultUsername() {
+  // Short, reproducible fallback from the session UUID tail
+  return "anon-" + SESSION_ID.replace(/-/g, "").slice(-6);
+}
+
+function getUsername()     { return localStorage.getItem("sf_uname") || defaultUsername(); }
+function saveUsername(raw) {
+  const clean = sanitizeUsername(raw);
+  if (clean) localStorage.setItem("sf_uname", clean);
+  return clean || getUsername();
+}
+
+// Strip HTML-dangerous + control chars, trim, hard cap at 24 chars.
+// @why  display_name is stored plaintext in Supabase — must be XSS-safe.
+function sanitizeUsername(raw) {
+  return (raw || "")
+    .replace(/[<>"'`\\]/g, "")
+    .replace(/[\x00-\x1f]/g, "")
+    .trim()
+    .slice(0, 24);
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUT SANITIZATION & VALIDATION
+// ──────────────────────────────────────────────────────────────────────────────
+// All user-supplied strings are validated before use or network transmission.
+// Message content is encrypted before storage, but display_name and room_id
+// are plaintext — those paths are where injection matters.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// @returns  { ok, value, err }
+function sanitizeMessage(raw) {
+  if (!raw || typeof raw !== "string") return { ok: false, err: "empty message" };
+  const v = raw.trim();
+  if (!v) return { ok: false, err: "empty message" };
+  if (v.length > MAX_MSG_CHARS)
+    return { ok: false, err: `max ${MAX_MSG_CHARS} chars` };
+  return { ok: true, value: v, err: null };
+}
+
+// @returns  { ok, err }
+function validateCarrier(url) {
+  if (!url || typeof url !== "string")   return { ok: false, err: "no carrier" };
+  if (!url.startsWith("data:image/"))    return { ok: false, err: "invalid carrier format" };
+  if (url.length > MAX_CARRIER_BYTES)    return { ok: false, err: "carrier too large" };
+  return { ok: true, err: null };
+}
+
+// Room ID must be lowercase alphanumeric, 4–16 chars.
+function validateRoomId(id) { return /^[a-z0-9]{4,16}$/.test(id); }
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // URL / ROOM HELPERS
 // ──────────────────────────────────────────────────────────────────────────────
-// Room identity is carried in the URL query string:
-//   ?room=abc123&mode=svg
+// Query params: ?r=ROOM_ID&m=MODE
+//   r — room ID  (short for "room")
+//   m — encoding mode  (short for "mode")
 //
-// The room code is public (safe to share). The passphrase is NOT in the URL.
-// Mode is included so joining participants see the correct encoding option
-// pre-selected without any extra negotiation.
-//
-// @why  replaceState (not pushState) — we don't want "back" to cycle through
-//       room states. The URL is a bookmark/share target, not a history entry.
+// Passphrase is NEVER in the URL.
+// @why  replaceState not pushState — URL is a share target, not a nav history.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// @returns { room: string, mode: string } — empty strings if params absent
 function getUrlParams() {
   const p = new URLSearchParams(window.location.search);
-  return { room: p.get("room") || "", mode: p.get("mode") || "svg" };
+  return { room: p.get("r") || "", mode: p.get("m") || "svg" };
 }
-
 function setUrlParams(room, mode) {
   const u = new URL(window.location.href);
-  u.searchParams.set("room", room);
-  u.searchParams.set("mode", mode);
+  u.searchParams.set("r", room);
+  u.searchParams.set("m", mode);
   window.history.replaceState({}, "", u.toString());
 }
-
-// Called on leave — cleans URL so a refresh goes to the setup screen
 function clearUrlParams() {
   const u = new URL(window.location.href);
-  u.searchParams.delete("room");
-  u.searchParams.delete("mode");
+  u.searchParams.delete("r");
+  u.searchParams.delete("m");
   window.history.replaceState({}, "", u.toString());
 }
 
-// Generates a 6-byte random room code mapped to a 36-char alphabet (a-z, 0-9).
-// @why  crypto.getRandomValues for randomness — Math.random() is not
-//       cryptographically secure and could produce predictable room IDs.
+// 6-byte crypto-random room code → 36-char alphabet (a-z, 0-9)
 function makeRoomId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(6)))
-    .map(b => "abcdefghijklmnopqrstuvwxyz0123456789"[b % 36])
-    .join("");
+    .map(b => "abcdefghijklmnopqrstuvwxyz0123456789"[b % 36]).join("");
 }
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ROOM TTL HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Human-readable countdown from now to expiresAt (ms epoch).
+function fmtCountdown(expiresAt) {
+  const ms = expiresAt - Date.now();
+  if (ms <= 0) return "expired";
+  const s=Math.floor(ms/1000), m=Math.floor(s/60), h=Math.floor(m/60), d=Math.floor(h/24);
+  if (d > 0)  return `${d}d ${h%24}h`;
+  if (h > 0)  return `${h}h ${m%60}m`;
+  if (m > 0)  return `${m}m ${s%60}s`;
+  return `${s}s`;
+}
+
+// Returns "normal" | "warning" (<1 day) | "critical" (<1 hour)
+function countdownUrgency(expiresAt) {
+  const ms = expiresAt - Date.now();
+  if (ms < 60*60*1000)      return "critical";
+  if (ms < 24*60*60*1000)   return "warning";
+  return "normal";
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SEND THROTTLE
+// ──────────────────────────────────────────────────────────────────────────────
+// Simple last-send timestamp check — 1 message per SEND_THROTTLE_MS.
+// Client-side only. The worker + Cloudflare Rate Limiting rules are the real
+// enforcement layer; this just gives instant UI feedback.
+// ══════════════════════════════════════════════════════════════════════════════
+
+let _lastSendTs = 0;
+function canSendNow()  { return Date.now() - _lastSendTs >= SEND_THROTTLE_MS; }
+function recordSend()  { _lastSendTs = Date.now(); }
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // CODEC — ENCRYPTION + CARRIER ENCODING
 // ──────────────────────────────────────────────────────────────────────────────
-// @flow  plaintext → encrypt → pack frame → embed in carrier image → data URL
+// @flow  plaintext → AES-GCM-256 encrypt → pack frame → embed in carrier → data URL
 //        data URL  → extract frame → unpack → decrypt → plaintext
 //
-// Two carrier modes:
-//   SVG  — payload stored in <desc data-p="..."> attribute, base64-encoded.
-//          Carrier looks like abstract gradient art.
-//   LSB  — payload encoded into least-significant bits of the red channel of a
-//          noise PNG. Carrier looks like static / pixel noise.
+// Modes:
+//   SVG — payload in <desc data-p="..."> base64 attribute. Looks like abstract art.
+//   LSB — payload in LSBs of red channel pixels of a noise PNG. Looks like static.
 //
 // Encryption constants:
-//   _PI  PBKDF2 iterations (100,000 — NIST minimum for interactive logins)
-//   _SB  Salt length in bytes (16)
-//   _IB  AES-GCM IV length in bytes (12 — spec-recommended)
-//   _MG  Magic number 0x534746 ("SGF") — identifies a Stegoframe payload
-//   _VR  Version byte (0x02) — allows future format changes
+//   _PI  PBKDF2 iterations (100,000)
+//   _SB  Salt bytes (16)
+//   _IB  AES-GCM IV bytes (12)
+//   _MG  Magic 0x534746 ("SGF") — frame identifier
+//   _VR  Version byte 0x02
 // ══════════════════════════════════════════════════════════════════════════════
 
-const _PI = 100_000, _SB = 16, _IB = 12, _MG = 0x534746, _VR = 0x02;
-
-// Encoding mode enum — frozen so callers can't accidentally mutate it
-const Enc = Object.freeze({ SVG: "svg", LSB: "lsb" });
+const _PI=100_000, _SB=16, _IB=12, _MG=0x534746, _VR=0x02;
+const Enc = Object.freeze({ SVG:"svg", LSB:"lsb" });
 
 // ── Key derivation ────────────────────────────────────────────────────────────
 
-// Derives an AES-GCM-256 key from a passphrase and salt using PBKDF2-SHA256.
-// @param p  string passphrase
+// @param p  passphrase string
 // @param s  Uint8Array salt (16 bytes, random per message)
-// @returns  CryptoKey (non-extractable — cannot be read back out of memory)
+// @returns  CryptoKey (non-extractable — stays in browser crypto subsystem)
 async function _dk(p, s) {
   const k = await crypto.subtle.importKey(
-    "raw", new TextEncoder().encode(p), { name: "PBKDF2" }, false, ["deriveKey"]
+    "raw", new TextEncoder().encode(p), {name:"PBKDF2"}, false, ["deriveKey"]
   );
   return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: s, iterations: _PI, hash: "SHA-256" },
-    k,
-    { name: "AES-GCM", length: 256 },
-    false, // non-extractable — key stays in the browser's crypto subsystem
-    ["encrypt", "decrypt"]
+    {name:"PBKDF2", salt:s, iterations:_PI, hash:"SHA-256"},
+    k, {name:"AES-GCM", length:256}, false, ["encrypt","decrypt"]
   );
 }
 
-// ── Encrypt / decrypt ─────────────────────────────────────────────────────────
-
-// Encrypts plaintext with AES-GCM-256 using a fresh random salt + IV per call.
-// @returns  Uint8Array: [salt(16)] + [iv(12)] + [ciphertext + auth tag]
+// @returns  Uint8Array: [salt(16)] + [iv(12)] + [ciphertext + 16-byte auth tag]
 async function _ae(txt, p) {
-  const s  = crypto.getRandomValues(new Uint8Array(_SB)); // fresh salt per message
-  const iv = crypto.getRandomValues(new Uint8Array(_IB)); // fresh IV per message
-  const ct = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    await _dk(p, s),
-    new TextEncoder().encode(txt)
-  );
-  // Concatenate salt + IV + ciphertext into a single byte array for framing
-  const o = new Uint8Array(_SB + _IB + ct.byteLength);
-  o.set(s); o.set(iv, _SB); o.set(new Uint8Array(ct), _SB + _IB);
+  const s=crypto.getRandomValues(new Uint8Array(_SB));
+  const iv=crypto.getRandomValues(new Uint8Array(_IB));
+  const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv}, await _dk(p,s), new TextEncoder().encode(txt));
+  const o=new Uint8Array(_SB+_IB+ct.byteLength);
+  o.set(s); o.set(iv,_SB); o.set(new Uint8Array(ct),_SB+_IB);
   return o;
 }
 
-// Decrypts a payload produced by _ae.
-// @returns  plaintext string, or null on wrong key / corrupt data
-// @why  Silent null return — AES-GCM authentication tag failure means either
-//       wrong passphrase or tampered data. We intentionally reveal nothing
-//       about which. The carrier just appears empty.
+// @returns  plaintext string, or null on wrong key / tampered data (silent failure)
+// @why  Silent null — AES-GCM auth tag failure reveals nothing about whether
+//       a payload exists. The carrier just appears empty.
 async function _ad(d, p) {
   try {
     return new TextDecoder().decode(
-      await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: d.slice(_SB, _SB + _IB) },
-        await _dk(p, d.slice(0, _SB)),
-        d.slice(_SB + _IB) // ciphertext starts after salt + IV
-      )
+      await crypto.subtle.decrypt({name:"AES-GCM",iv:d.slice(_SB,_SB+_IB)}, await _dk(p,d.slice(0,_SB)), d.slice(_SB+_IB))
     );
   } catch { return null; }
 }
 
-// ── Binary frame ──────────────────────────────────────────────────────────────
-// Every payload is wrapped in an 8-byte frame header before carrier embedding:
-//   [0-2]  Magic (3 bytes): 0x53 0x47 0x46 — "SGF" in ASCII
-//   [3]    Version (1 byte): 0x02
-//   [4-7]  Payload length (uint32 big-endian)
-//   [8+]   Payload bytes (the encrypted blob)
-//
-// The magic + version allow a reader to quickly confirm this is a Stegoframe
-// payload before attempting decryption, and to detect version mismatches.
+// ── Binary frame (8-byte header wraps every payload before carrier embedding) ─
+// [0-2] Magic 0x53 0x47 0x46 | [3] Version | [4-7] uint32 length BE | [8+] payload
 
-// Packs a payload byte array into a framed Uint8Array.
-// @param p  Uint8Array — the encrypted payload bytes
 function _pk(p) {
-  const b = new Uint8Array(8 + p.length);
-  // Write magic as three separate bytes (big-endian, 3-byte integer)
-  b[0] = (_MG >> 16) & 0xFF;
-  b[1] = (_MG >>  8) & 0xFF;
-  b[2] =  _MG        & 0xFF;
-  b[3] = _VR;
-  // Write payload length as uint32 big-endian
-  const l = p.length;
-  b[4] = (l >> 24) & 0xFF; b[5] = (l >> 16) & 0xFF;
-  b[6] = (l >>  8) & 0xFF; b[7] =  l         & 0xFF;
-  b.set(p, 8);
-  return b;
+  const b=new Uint8Array(8+p.length);
+  b[0]=(_MG>>16)&0xFF; b[1]=(_MG>>8)&0xFF; b[2]=_MG&0xFF; b[3]=_VR;
+  const l=p.length;
+  b[4]=(l>>24)&0xFF; b[5]=(l>>16)&0xFF; b[6]=(l>>8)&0xFF; b[7]=l&0xFF;
+  b.set(p,8); return b;
 }
-
-// Unpacks a framed byte array, validates magic + version, returns payload bytes.
-// @returns  Uint8Array payload, or null if magic/version mismatch or too short
 function _up(b) {
-  if (b.length < 8) return null;
-  if (((b[0] << 16) | (b[1] << 8) | b[2]) !== _MG || b[3] !== _VR) return null;
-  const l = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7];
-  return (l > 0 && l <= b.length - 8) ? b.slice(8, 8 + l) : null;
+  if(b.length<8) return null;
+  if(((b[0]<<16)|(b[1]<<8)|b[2])!==_MG||b[3]!==_VR) return null;
+  const l=(b[4]<<24)|(b[5]<<16)|(b[6]<<8)|b[7];
+  return(l>0&&l<=b.length-8)?b.slice(8,8+l):null;
 }
 
-// ── Base64 helpers ────────────────────────────────────────────────────────────
-// @why  We use manual loops (not TextDecoder/TextEncoder) because btoa/atob
-//       work on binary strings, not typed arrays. These bridge that gap.
+// ── Base64 / bit helpers ──────────────────────────────────────────────────────
+// @why  Manual loops because btoa/atob work on binary strings, not typed arrays.
 
-// Uint8Array → base64 string
-function _ub(b) {
-  let s = "";
-  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
-  return btoa(s);
-}
-
-// base64 string → Uint8Array
-function _bu(s) {
-  const b = atob(s), a = new Uint8Array(b.length);
-  for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i);
-  return a;
-}
-
-// Bit array (0s and 1s) → Uint8Array — used when reading LSB pixels
-// @param bits  Array of 0/1 values, length must be a multiple of 8
-function _b2B(bits) {
-  const b = new Uint8Array(Math.floor(bits.length / 8));
-  for (let i = 0; i < b.length; i++) {
-    let v = 0;
-    // Reconstruct each byte MSB-first from 8 consecutive bits
-    for (let j = 0; j < 8; j++) v = (v << 1) | bits[i * 8 + j];
-    b[i] = v;
-  }
+function _ub(b){let s="";for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s);}
+function _bu(s){const b=atob(s),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a;}
+function _b2B(bits){
+  const b=new Uint8Array(Math.floor(bits.length/8));
+  for(let i=0;i<b.length;i++){let v=0;for(let j=0;j<8;j++)v=(v<<1)|bits[i*8+j];b[i]=v;}
   return b;
 }
 
-// ── LSB carrier: write ────────────────────────────────────────────────────────
+// ── LSB carrier ───────────────────────────────────────────────────────────────
 
-// Encodes a payload into the LSB of the red channel of a noise PNG.
-// @param payload  Uint8Array — the packed (framed + encrypted) bytes
-// @returns  data URL string: "data:image/png;base64,..."
-// @flow
-//   1. Calculate canvas dimensions: square root of total bits needed,
-//      minimum 32×32 so very short payloads still look like noise.
-//   2. Fill canvas with cryptographic random noise (visually: static).
-//   3. Force all alpha values to 255 (fully opaque — transparency would
-//      reveal that pixels are not natural image data).
-//   4. Overwrite the LSB of each red channel byte with one payload bit,
-//      MSB-first. The change is 0 or 1 — invisible to the eye.
+// Writes payload into LSB of red channel pixels of a square noise PNG.
+// Alpha forced to 255 — transparency would reveal the image is synthetic.
 function lsbWrite(payload) {
-  const pk  = _pk(payload);
-  const dim = Math.max(32, Math.ceil(Math.sqrt(pk.length * 8))); // bits → pixels
-  const cv  = document.createElement("canvas");
-  cv.width = cv.height = dim;
-  const cx = cv.getContext("2d");
-  const im = cx.createImageData(dim, dim);
-  crypto.getRandomValues(im.data);                          // random noise cover
-  for (let i = 3; i < im.data.length; i += 4) im.data[i] = 255; // fix alpha
-  for (let i = 0; i < pk.length * 8; i++) {
-    const bit = (pk[Math.floor(i / 8)] >> (7 - (i % 8))) & 1; // extract bit MSB-first
-    im.data[i * 4] = (im.data[i * 4] & 0xFE) | bit;           // set LSB of R channel
+  const pk=_pk(payload);
+  const dim=Math.max(32,Math.ceil(Math.sqrt(pk.length*8)));
+  const cv=document.createElement("canvas"); cv.width=cv.height=dim;
+  const cx=cv.getContext("2d"), im=cx.createImageData(dim,dim);
+  crypto.getRandomValues(im.data);
+  for(let i=3;i<im.data.length;i+=4) im.data[i]=255;
+  for(let i=0;i<pk.length*8;i++){
+    const bit=(pk[Math.floor(i/8)]>>(7-(i%8)))&1;
+    im.data[i*4]=(im.data[i*4]&0xFE)|bit;
   }
-  cx.putImageData(im, 0, 0);
-  return cv.toDataURL("image/png");
+  cx.putImageData(im,0,0); return cv.toDataURL("image/png");
 }
 
-// ── LSB carrier: read ─────────────────────────────────────────────────────────
-
-// Decodes a payload from the LSB of the red channel of a PNG data URL.
-// @param url  data URL string — "data:image/png;base64,..."
-// @returns  Promise<Uint8Array|null> — null if no valid frame found
-// @why  No crossOrigin attribute on the Image element. Data URLs are
-//       same-origin by definition. Setting crossOrigin="anonymous" on a
-//       data URL triggers CORS canvas taint in Chrome/Android, which causes
-//       getImageData() to silently return zeroed pixel data — a subtle and
-//       hard-to-debug failure mode.
+// @why  No crossOrigin on Image — data URLs are same-origin. crossOrigin="anonymous"
+//       causes canvas taint on Chrome/Android, silently zeroing getImageData().
 async function lsbRead(url) {
-  return new Promise(res => {
-    const im = new Image();
-    im.onload = () => {
-      const cv = document.createElement("canvas");
-      cv.width = im.width; cv.height = im.height;
-      const cx = cv.getContext("2d");
-      cx.drawImage(im, 0, 0);
-      const d = cx.getImageData(0, 0, im.width, im.height).data;
-
-      // Read first 64 pixels (= 8 bytes) to validate the frame header
-      const hb = [];
-      for (let i = 0; i < 64; i++) hb.push(d[i * 4] & 1); // LSB of R channel only
-      const hdr = _b2B(hb);
-      if (!_up(hdr)) { res(null); return; } // magic/version mismatch — not a Stegoframe carrier
-
-      // Extract payload length from header bytes [4-7], then read that many bits
-      const l  = (hdr[4] << 24) | (hdr[5] << 16) | (hdr[6] << 8) | hdr[7];
-      const tb = (8 + l) * 8; // total bits to read: header + payload
-      const ab = [];
-      for (let i = 0; i < tb; i++) ab.push(d[i * 4] & 1);
+  return new Promise(res=>{
+    const im=new Image();
+    im.onload=()=>{
+      const cv=document.createElement("canvas"); cv.width=im.width; cv.height=im.height;
+      const cx=cv.getContext("2d"); cx.drawImage(im,0,0);
+      const d=cx.getImageData(0,0,im.width,im.height).data;
+      const hb=[]; for(let i=0;i<64;i++) hb.push(d[i*4]&1);
+      const hdr=_b2B(hb);
+      if(!_up(hdr)){res(null);return;}
+      const l=(hdr[4]<<24)|(hdr[5]<<16)|(hdr[6]<<8)|hdr[7],tb=(8+l)*8,ab=[];
+      for(let i=0;i<tb;i++) ab.push(d[i*4]&1);
       res(_up(_b2B(ab)));
     };
-    im.onerror = () => res(null);
-    im.src = url;
+    im.onerror=()=>res(null); im.src=url;
   });
 }
 
-// ── SVG carrier: write ────────────────────────────────────────────────────────
+// ── SVG carrier ───────────────────────────────────────────────────────────────
 
-// Encodes a payload into a <desc data-p="..."> attribute inside a decorative SVG.
-// @param payload  Uint8Array — the packed (framed + encrypted) bytes
-// @returns  data URL string: "data:image/svg+xml;base64,..."
-// @flow
-//   1. Base64-encode the packed payload.
-//   2. Generate a random hue pair with golden-angle offset (137°) for a
-//      visually pleasing gradient that looks different each message.
-//   3. Place 5 semi-transparent circles at random positions — adds organic
-//      visual noise so the SVG doesn't look templated.
-//   4. Embed payload in <desc data-p="..."> — the <desc> element is part of
-//      the SVG accessibility spec, so it attracts no suspicion.
-//   5. Encode the entire SVG as base64 to produce a portable data URL.
-// @why  btoa(unescape(encodeURIComponent(...))) — the SVG may contain
-//       multi-byte UTF-8 characters from the base64 alphabet. This chain
-//       safely converts the full UTF-8 string to a Latin-1 binary string
-//       that btoa can handle without "character out of range" errors.
+// Embeds payload in <desc data-p="..."> of a decorative gradient SVG.
+// @why  btoa(unescape(encodeURIComponent(...))) — handles multi-byte UTF-8 safely.
 function svgWrite(payload) {
-  const b64 = _ub(_pk(payload));
-  const h   = Math.floor(Math.random() * 360);    // random base hue
-  const h2  = (h + 137) % 360;                    // golden-angle complementary hue
-  const els = Array.from({ length: 5 }, (_, i) =>
-    `<circle cx="${(8 + Math.random() * 84).toFixed(1)}" cy="${(8 + Math.random() * 84).toFixed(1)}" r="${(2 + Math.random() * 8).toFixed(1)}" fill="hsla(${(h + i * 43) % 360},45%,60%,0.1)"/>`
+  const b64=_ub(_pk(payload));
+  const h=Math.floor(Math.random()*360), h2=(h+137)%360;
+  const els=Array.from({length:5},(_,i)=>
+    `<circle cx="${(8+Math.random()*84).toFixed(1)}" cy="${(8+Math.random()*84).toFixed(1)}" r="${(2+Math.random()*8).toFixed(1)}" fill="hsla(${(h+i*43)%360},45%,60%,0.1)"/>`
   ).join("");
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">`
-    + `<desc data-f="${_VR}" data-p="${b64}"/>`  // data-f = format version, data-p = payload
-    + `<defs><radialGradient id="g" cx="42%" cy="42%" r="62%">`
-    + `<stop offset="0%" stop-color="hsl(${h},50%,62%)"/>`
-    + `<stop offset="100%" stop-color="hsl(${h2},42%,18%)"/>`
-    + `</radialGradient></defs>`
-    + `<rect width="100" height="100" fill="url(#g)"/>${els}</svg>`;
-  return "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svg)));
+  const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">`
+    +`<desc data-f="${_VR}" data-p="${b64}"/>`
+    +`<defs><radialGradient id="g" cx="42%" cy="42%" r="62%">`
+    +`<stop offset="0%" stop-color="hsl(${h},50%,62%)"/>`
+    +`<stop offset="100%" stop-color="hsl(${h2},42%,18%)"/>`
+    +`</radialGradient></defs><rect width="100" height="100" fill="url(#g)"/>${els}</svg>`;
+  return "data:image/svg+xml;base64,"+btoa(unescape(encodeURIComponent(svg)));
 }
 
-// ── SVG carrier: read ─────────────────────────────────────────────────────────
-
-// Extracts the payload from a Stegoframe SVG data URL.
-// @param url  data URL string — "data:image/svg+xml;base64,..."
-// @returns  Uint8Array|null — null if no valid data-p attribute found
 function svgRead(url) {
   try {
-    // Reverse the btoa(unescape(encodeURIComponent(...))) encoding from svgWrite
-    const raw = decodeURIComponent(escape(atob(url.split(",")[1])));
-    const m   = raw.match(/data-p="([A-Za-z0-9+/=]+)"/);
-    return m ? _up(_bu(m[1])) : null;
+    const raw=decodeURIComponent(escape(atob(url.split(",")[1])));
+    const m=raw.match(/data-p="([A-Za-z0-9+/=]+)"/);
+    return m?_up(_bu(m[1])):null;
   } catch { return null; }
 }
 
 // ── Codec public API ──────────────────────────────────────────────────────────
 
 const Codec = {
-  // Encrypts text and encodes into a carrier image.
-  // @param txt   string — plaintext message
-  // @param pass  string — shared passphrase
-  // @param mode  Enc.SVG | Enc.LSB
-  // @returns  Promise<string> — carrier data URL
-  async encode(txt, pass, mode) {
-    const e = await _ae(txt, pass);
-    return mode === Enc.LSB ? lsbWrite(e) : svgWrite(e);
+  async encode(txt,pass,mode) {
+    const e=await _ae(txt,pass);
+    return mode===Enc.LSB?lsbWrite(e):svgWrite(e);
   },
-
-  // Tries SVG decode first (fast, synchronous), falls back to LSB (async canvas).
-  // @param url   string — carrier data URL
-  // @param pass  string — shared passphrase
-  // @returns  Promise<string|null> — plaintext, or null on failure
-  async decode(url, pass) {
-    let r = svgRead(url);
-    if (!r) r = await lsbRead(url); // SVG failed — try LSB
-    if (!r) return null;            // no valid frame in either mode
-    return _ad(r, pass);
+  async decode(url,pass) {
+    let r=svgRead(url);
+    if(!r) r=await lsbRead(url); // SVG failed — try LSB
+    if(!r) return null;
+    return _ad(r,pass);
   },
-
-  // Peeks at the first 64 decoded bytes of the data URL to detect the carrier type.
-  // @why  We can't rely on the data URL MIME type alone — paste inputs may
-  //       arrive as bare base64 strings that were wrapped heuristically.
   sniff(url) {
-    if (!url) return Enc.SVG;
-    try {
-      const p = atob(url.split(",")[1]).slice(0, 64);
-      if (p.includes("<svg")) return Enc.SVG;
-    } catch {}
+    if(!url) return Enc.SVG;
+    try{const p=atob(url.split(",")[1]).slice(0,64);if(p.includes("<svg"))return Enc.SVG;}catch{}
     return Enc.LSB;
   },
 };
@@ -458,32 +389,47 @@ const Codec = {
 // ══════════════════════════════════════════════════════════════════════════════
 // SUPABASE DB TRANSPORT
 // ──────────────────────────────────────────────────────────────────────────────
-// These functions are the only layer that touches the network. Everything above
-// is pure local computation. Everything below is Supabase I/O.
+// Schema:
+//   rooms    { id text PK, created_at timestamptz, expires_at timestamptz }
+//   messages { id uuid PK, room_id text, carrier text, mode text,
+//              sender_id text, display_name text, ts timestamptz }
 //
-// Schema: messages { id, room_id, carrier, mode, sender_id, ts }
-//   carrier  — the encrypted data URL. Supabase sees this as an opaque string.
-//   mode     — "svg" | "lsb" — stored so the receiver knows how to decode.
-//   sender_id — ephemeral session UUID. Not authenticated; trust-on-first-use.
+//   display_name — plaintext username stored openly. Not sensitive content.
+//                  The encrypted carrier is the sensitive payload.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Posts an encrypted carrier to the room. Returns the Supabase-assigned row id.
-// @why  We request .select("id").single() so we get the DB-generated UUID back
-//       immediately. This is used to patch the optimistic local message with
-//       its real id so deletes work correctly.
-async function dbPost(roomId, carrier, mode, senderId) {
+// Ensure room exists; create with 7-day TTL if not. Returns { expiresAt: ms epoch }.
+// @why  upsert would silently reset expires_at on every join — we want the
+//       original creation time to be authoritative, so we read-then-insert.
+async function dbEnsureRoom(roomId) {
+  const { data: existing } = await sb
+    .from("rooms").select("expires_at").eq("id", roomId).single();
+  if (existing) return { expiresAt: new Date(existing.expires_at).getTime() };
+
+  // New room — calculate TTL from now
+  const expiresAt = new Date(Date.now() + ROOM_TTL_MS).toISOString();
+  const { data, error } = await sb
+    .from("rooms").insert({ id: roomId, expires_at: expiresAt })
+    .select("expires_at").single();
+  if (error) throw error;
+  return { expiresAt: new Date(data.expires_at).getTime() };
+}
+
+// Post carrier. Returns DB-assigned row id (needed for delete patching).
+async function dbPost(roomId, carrier, mode, senderId, displayName) {
   const { data, error } = await sb.from("messages").insert({
-    room_id: roomId, carrier, mode, sender_id: senderId,
+    room_id: roomId, carrier, mode,
+    sender_id: senderId,
+    display_name: sanitizeUsername(displayName),
   }).select("id").single();
   if (error) throw error;
   return data.id;
 }
 
-// Loads the 200 most recent messages for a room, oldest first (for rendering).
+// Load 200 most recent messages, oldest first.
 async function dbLoad(roomId) {
   const { data, error } = await sb
-    .from("messages")
-    .select("*")
+    .from("messages").select("*")
     .eq("room_id", roomId)
     .order("ts", { ascending: true })
     .limit(200);
@@ -491,195 +437,187 @@ async function dbLoad(roomId) {
   return data ?? [];
 }
 
-// Hard-deletes a single message by its DB id.
 async function dbDelete(id) {
   const { error } = await sb.from("messages").delete().eq("id", id);
   if (error) throw error;
 }
 
-// Wipes all messages for a room — called when a participant leaves.
-// @why  Leaving is destructive by design. The room has no persistent identity
-//       beyond its messages. Wiping on leave is the session expiry mechanism.
+// Wipe all messages AND the room row. Called on leave or TTL expiry.
 async function dbDeleteRoom(roomId) {
-  const { error } = await sb.from("messages").delete().eq("room_id", roomId);
-  if (error) throw error;
+  await sb.from("messages").delete().eq("room_id", roomId);
+  await sb.from("rooms").delete().eq("id", roomId);
 }
 
-// Opens a Supabase Realtime channel for a room and listens for INSERT + DELETE.
-// @param roomId    string
-// @param onInsert  fn(row) — called with the new DB row on INSERT
-// @param onDelete  fn(id)  — called with the deleted row's id on DELETE
-// @returns  unsubscribe function — call on component unmount
-// @why  `replica identity full` must be set on the messages table (see README)
-//       for DELETE payloads to include the full old row. Without it, payload.old
-//       only contains the primary key — which happens to be sufficient here, but
-//       full replica identity makes the contract explicit and future-proof.
+// Subscribe to INSERT + DELETE realtime events for a room.
+// @returns  unsubscribe fn
+// @why  `replica identity full` must be set on messages table for DELETE
+//       events to carry the old row id. See README for SQL setup.
 function dbSubscribe(roomId, onInsert, onDelete) {
   const ch = sb.channel(`room:${roomId}`)
-    .on("postgres_changes", {
-      event: "INSERT", schema: "public", table: "messages",
-      filter: `room_id=eq.${roomId}`,
-    }, payload => onInsert(payload.new))
-    .on("postgres_changes", {
-      event: "DELETE", schema: "public", table: "messages",
-      filter: `room_id=eq.${roomId}`,
-    }, payload => {
-      const id = payload.old?.id;
-      if (id) onDelete(id); // guard: id will be present with replica identity full
-    })
+    .on("postgres_changes",{event:"INSERT",schema:"public",table:"messages",filter:`room_id=eq.${roomId}`},
+      p=>onInsert(p.new))
+    .on("postgres_changes",{event:"DELETE",schema:"public",table:"messages",filter:`room_id=eq.${roomId}`},
+      p=>{ const id=p.old?.id; if(id) onDelete(id); })
     .subscribe();
-  return () => sb.removeChannel(ch);
+  return ()=>sb.removeChannel(ch);
 }
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // DESIGN TOKENS
-// ──────────────────────────────────────────────────────────────────────────────
-// Single source of truth for all colours. Inline styles reference T.* throughout.
-// Named by role, not by value — e.g. T.raised not T.dark2 — so the palette
-// can be swapped without hunting through JSX.
 // ══════════════════════════════════════════════════════════════════════════════
 
-const T = {
-  // ── Backgrounds (darkest → lightest)
-  bg:     "#08090c", // page background
-  surf:   "#0e1116", // surface (input areas, paste bar)
-  raised: "#13161c", // raised surface (header, message bubbles)
-
-  // ── Border shades
-  b0: "#1e2229", // subtle dividers
-  b1: "#2c3240", // standard borders
-  b2: "#3e4656", // hover / active borders
-
-  // ── Text shades (dimmest → brightest)
-  dim:    "#4a5568",
-  muted:  "#6b7a8d",
-  sub:    "#8899aa",
-  txt:    "#b8c4d0",
-  bright: "#dce6f0",
-  white:  "#f0f5fa",
-
-  // ── Accent: green (outbound, active, success)
-  green: "#1dff8f",
-  gd:    "#071a0f", // green-tinted dark background
-
-  // ── Accent: red (errors, danger actions)
-  red: "#ff3d5a",
-  rd:  "#1a0508", // red-tinted dark background
-
-  // ── Accent: amber (connecting / warning state)
-  amber: "#ffb840",
-
-  // ── Accent: blue (reserved, not yet used in UI)
-  blue: "#4db8ff",
-  bd:   "#001422",
-
-  // ── Message bubble backgrounds + borders
-  out:  "#0d1f2d", outB: "#1a3a52", // outbound (blue tint, right-aligned)
-  inc:  "#0f1318", incB: "#1e2229", // inbound  (neutral dark, left-aligned)
+const T={
+  bg:"#08090c",surf:"#0e1116",raised:"#13161c",
+  b0:"#1e2229",b1:"#2c3240",b2:"#3e4656",
+  dim:"#4a5568",muted:"#6b7a8d",sub:"#8899aa",txt:"#b8c4d0",bright:"#dce6f0",white:"#f0f5fa",
+  green:"#1dff8f",gd:"#071a0f",
+  red:"#ff3d5a",rd:"#1a0508",
+  amber:"#ffb840",ad:"#1a1000",
+  blue:"#4db8ff",bd:"#001422",
+  out:"#0d1f2d",outB:"#1a3a52",
+  inc:"#0f1318",incB:"#1e2229",
 };
-
-// Font stack constants — used in inline fontFamily declarations
-const MONO = "'DM Mono','Fira Code','Courier New',monospace";
-const DISP = "'Syne',sans-serif"; // display / wordmark only
+const MONO="'DM Mono','Fira Code','Courier New',monospace";
+const DISP="'Syne',sans-serif";
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // UTILITIES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Wraps a bare base64 string in the correct data URL prefix by peeking at the
-// first 64 decoded bytes. Identifies SVG by looking for "<svg" or "<?xml".
-// @why  When users paste a copied carrier URL, they may paste only the base64
-//       portion (after the comma). Without MIME sniffing, we'd have to ask them
-//       which type it is — this handles it transparently.
-function wrapB64(s) {
-  try {
-    const p = atob(s).slice(0, 64);
-    if (p.includes("<svg") || p.includes("<?xml")) return "data:image/svg+xml;base64," + s;
-  } catch {}
-  return "data:image/png;base64," + s;
+// Wraps bare base64 in the correct data URL MIME prefix by peeking at bytes.
+function wrapB64(s){
+  try{const p=atob(s).slice(0,64);if(p.includes("<svg")||p.includes("<?xml"))return"data:image/svg+xml;base64,"+s;}catch{}
+  return"data:image/png;base64,"+s;
 }
 
-// Accepts a string that is either a data URL or a bare base64 string.
-// @returns  data URL string, or null if the string is not valid base64
-function toDataUrl(s) {
-  s = s.trim();
-  if (s.startsWith("data:")) return s; // already a data URL
-  try { atob(s); return wrapB64(s); } catch {} // valid base64 — wrap it
-  return null; // not base64 — reject
+// Accepts data URL or bare base64 string. Returns data URL or null.
+function toDataUrl(s){
+  s=s.trim();
+  if(s.startsWith("data:"))return s;
+  try{atob(s);return wrapB64(s);}catch{}
+  return null;
 }
 
-// Formats a Unix timestamp as a short HH:MM time string for message metadata.
-function fmtTime(ts) {
-  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function fmtTime(ts){return new Date(ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});}
+
+// Returns a function that delays invoking fn until after wait ms of silence.
+function debounce(fn,wait){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),wait);};}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COMPONENT: CountdownBadge
+// ──────────────────────────────────────────────────────────────────────────────
+// Live countdown to room expiry, updating every second.
+// Colour: normal (dim) → warning (amber, <1 day) → critical (red, <1 hour).
+//
+// @prop expiresAt  number — ms epoch
+// ══════════════════════════════════════════════════════════════════════════════
+
+function CountdownBadge({ expiresAt }) {
+  const [label,   setLabel]   = useState(fmtCountdown(expiresAt));
+  const [urgency, setUrgency] = useState(countdownUrgency(expiresAt));
+
+  useEffect(()=>{
+    const tick=()=>{ setLabel(fmtCountdown(expiresAt)); setUrgency(countdownUrgency(expiresAt)); };
+    const id=setInterval(tick,1000);
+    return()=>clearInterval(id);
+  },[expiresAt]);
+
+  const color=urgency==="critical"?T.red:urgency==="warning"?T.amber:T.dim;
+  return(
+    <span title={`Expires ${new Date(expiresAt).toLocaleString()}`}
+      style={{fontSize:8,color,letterSpacing:"0.1em",flexShrink:0,fontFamily:MONO}}>
+      ⏱{label}
+    </span>
+  );
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COMPONENT: ProfileWidget
+// ──────────────────────────────────────────────────────────────────────────────
+// Inline popover for editing the display name. Opens from the ✎ header button.
+// Saves to localStorage on confirm. New name appears on next sent message.
+//
+// @prop onClose  fn()
+// ══════════════════════════════════════════════════════════════════════════════
+
+function ProfileWidget({ onClose }) {
+  const [val,   setVal]   = useState(getUsername());
+  const [saved, setSaved] = useState(false);
+
+  const save=()=>{
+    const clean=saveUsername(val);
+    setVal(clean); setSaved(true);
+    setTimeout(()=>{ setSaved(false); onClose(); },800);
+  };
+
+  return(
+    <div style={{
+      position:"absolute",top:48,right:12,zIndex:100,
+      background:T.surf,border:`1px solid ${T.b1}`,borderRadius:4,
+      padding:14,width:220,animation:"fadeUp 0.15s ease",boxShadow:"0 8px 24px rgba(0,0,0,0.5)",
+    }}>
+      <div style={{fontSize:8,color:T.muted,letterSpacing:"0.25em",textTransform:"uppercase",marginBottom:8}}>display name</div>
+      <div style={{display:"flex",gap:6}}>
+        <input value={val} onChange={e=>setVal(e.target.value.slice(0,24))} maxLength={24}
+          onKeyDown={e=>{if(e.key==="Enter")save();if(e.key==="Escape")onClose();}}
+          autoFocus
+          style={{flex:1,background:T.raised,border:`1px solid ${T.b1}`,color:T.bright,padding:"6px 8px",fontSize:11,outline:"none",borderRadius:2}}
+        />
+        <button onClick={save} style={{background:T.gd,border:`1px solid ${T.green}`,color:T.green,padding:"6px 10px",fontSize:9,cursor:"pointer",borderRadius:2,letterSpacing:"0.1em"}}>
+          {saved?"✓":"save"}
+        </button>
+      </div>
+      <div style={{fontSize:8,color:T.dim,marginTop:6,lineHeight:1.6}}>Max 24 chars · stored locally · shown beside messages.</div>
+    </div>
+  );
 }
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // COMPONENT: CarrierThumb
 // ──────────────────────────────────────────────────────────────────────────────
-// Renders a small carrier image thumbnail beneath a message bubble.
-// Tapping expands an inspector panel with copy/download options.
+// Thumbnail + expandable inspector for a carrier image.
 //
-// @prop carrier  string  — data URL of the carrier image
-// @prop mode     string  — Enc.SVG | Enc.LSB (controls imageRendering style)
+// @prop carrier  string — data URL
+// @prop mode     string — Enc.SVG | Enc.LSB
 // ══════════════════════════════════════════════════════════════════════════════
 
 function CarrierThumb({ carrier, mode }) {
-  const [open,   setOpen]   = useState(false);
-  const [copied, setCopied] = useState(false);
-
-  // Use SVG rendering for SVG carriers, pixelated for LSB (preserves noise aesthetic)
-  const isSvg = mode === Enc.SVG || carrier?.startsWith("data:image/svg");
-  if (!carrier) return null;
-
-  const copy = () =>
-    navigator.clipboard?.writeText(carrier).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
-
-  const dl = () => {
-    const a = document.createElement("a");
-    a.href = carrier;
-    a.download = `carrier.${isSvg ? "svg" : "png"}`;
-    a.click();
-  };
-
-  return (
+  const [open,setOpen]     = useState(false);
+  const [copied,setCopied] = useState(false);
+  const isSvg=mode===Enc.SVG||carrier?.startsWith("data:image/svg");
+  if(!carrier) return null;
+  const copy=()=>navigator.clipboard?.writeText(carrier).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),1500);});
+  const dl=()=>{const a=document.createElement("a");a.href=carrier;a.download=`carrier.${isSvg?"svg":"png"}`;a.click();};
+  return(
     <>
-      {/* Collapsed thumbnail row — tap to expand */}
-      <div
-        onClick={() => setOpen(v => !v)}
-        style={{ display:"inline-flex", alignItems:"center", gap:6, marginTop:6, cursor:"pointer", opacity:0.65, transition:"opacity 0.15s" }}
-        onMouseEnter={e => e.currentTarget.style.opacity = 1}
-        onMouseLeave={e => e.currentTarget.style.opacity = 0.65}
-      >
-        <div style={{ width:26, height:26, borderRadius:2, overflow:"hidden", border:`1px solid ${T.b1}`, flexShrink:0, background:T.raised }}>
-          <img src={carrier} style={{ width:"100%", height:"100%", imageRendering:isSvg?"auto":"pixelated", display:"block" }} alt=""/>
+      <div onClick={()=>setOpen(v=>!v)}
+        style={{display:"inline-flex",alignItems:"center",gap:6,marginTop:6,cursor:"pointer",opacity:0.65,transition:"opacity 0.15s"}}
+        onMouseEnter={e=>e.currentTarget.style.opacity=1}
+        onMouseLeave={e=>e.currentTarget.style.opacity=0.65}>
+        <div style={{width:26,height:26,borderRadius:2,overflow:"hidden",border:`1px solid ${T.b1}`,flexShrink:0,background:T.raised}}>
+          <img src={carrier} style={{width:"100%",height:"100%",imageRendering:isSvg?"auto":"pixelated",display:"block"}} alt=""/>
         </div>
-        <span style={{ fontSize:8, color:T.muted, letterSpacing:"0.15em" }}>
-          {isSvg ? "SVG" : "LSB"} carrier {open ? "▲" : "▼"}
-        </span>
+        <span style={{fontSize:8,color:T.muted,letterSpacing:"0.15em"}}>{isSvg?"SVG":"LSB"} carrier {open?"▲":"▼"}</span>
       </div>
-
-      {/* Expanded inspector */}
-      {open && (
-        <div style={{ marginTop:6, background:T.raised, border:`1px solid ${T.b1}`, borderRadius:3, padding:10, animation:"fadeUp 0.15s ease" }}>
-          <div style={{ display:"flex", gap:10, alignItems:"flex-start" }}>
-            <div style={{ width:56, height:56, borderRadius:2, overflow:"hidden", border:`1px solid ${T.b1}`, flexShrink:0 }}>
-              <img src={carrier} style={{ width:"100%", height:"100%", imageRendering:isSvg?"auto":"pixelated", display:"block" }} alt=""/>
+      {open&&(
+        <div style={{marginTop:6,background:T.raised,border:`1px solid ${T.b1}`,borderRadius:3,padding:10,animation:"fadeUp 0.15s ease"}}>
+          <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+            <div style={{width:56,height:56,borderRadius:2,overflow:"hidden",border:`1px solid ${T.b1}`,flexShrink:0}}>
+              <img src={carrier} style={{width:"100%",height:"100%",imageRendering:isSvg?"auto":"pixelated",display:"block"}} alt=""/>
             </div>
-            <div style={{ flex:1, minWidth:0 }}>
-              {/* Truncated preview of the base64 payload — just enough to identify it */}
-              <div style={{ fontSize:8, color:T.dim, wordBreak:"break-all", lineHeight:1.5, maxHeight:32, overflow:"hidden" }}>
-                {carrier.split(",")[1]?.slice(0, 56)}…
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:8,color:T.dim,wordBreak:"break-all",lineHeight:1.5,maxHeight:32,overflow:"hidden"}}>
+                {carrier.split(",")[1]?.slice(0,56)}…
               </div>
-              <div style={{ display:"flex", gap:6, marginTop:8, flexWrap:"wrap" }}>
-                <Btn small ghost onClick={copy}>{copied ? "copied ✓" : "copy url"}</Btn>
+              <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+                <Btn small ghost onClick={copy}>{copied?"copied ✓":"copy url"}</Btn>
                 <Btn small ghost onClick={dl}>↓ save</Btn>
-                <Btn small ghost onClick={() => setOpen(false)}>✕</Btn>
+                <Btn small ghost onClick={()=>setOpen(false)}>✕</Btn>
               </div>
             </div>
           </div>
@@ -691,35 +629,20 @@ function CarrierThumb({ carrier, mode }) {
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// COMPONENT: Btn
-// ──────────────────────────────────────────────────────────────────────────────
-// Reusable button primitive. Supports three visual variants:
-//   default — raised dark background, standard text
-//   ghost   — transparent background, border only
-//   danger  — red-tinted background, red text
-//
-// @prop small    boolean — compact padding + smaller font for inline use
-// @prop disabled boolean — muted styles + not-allowed cursor
+// COMPONENT: Btn — reusable button primitive
+// @prop ghost / danger / small / disabled
 // ══════════════════════════════════════════════════════════════════════════════
 
-function Btn({ children, onClick, disabled, ghost, danger, small, style = {} }) {
-  const bg  = danger ? T.rd  : ghost ? "transparent" : T.raised;
-  const bdr = danger ? T.red : T.b1;
-  const col = danger ? T.red : ghost ? T.sub : T.txt;
-  return (
+function Btn({children,onClick,disabled,ghost,danger,small,style={}}){
+  const bg=danger?T.rd:ghost?"transparent":T.raised;
+  const bdr=danger?T.red:T.b1;
+  const col=danger?T.red:ghost?T.sub:T.txt;
+  return(
     <button onClick={onClick} disabled={disabled} style={{
-      background:     disabled ? T.surf : bg,
-      border:         `1px solid ${disabled ? T.b0 : bdr}`,
-      color:          disabled ? T.dim  : col,
-      padding:        small ? "3px 8px" : "8px 14px",
-      fontSize:       small ? 8 : 9,
-      letterSpacing:  "0.18em",
-      cursor:         disabled ? "not-allowed" : "pointer",
-      borderRadius:   2,
-      transition:     "all 0.15s",
-      textTransform:  "uppercase",
-      whiteSpace:     "nowrap",
-      ...style,
+      background:disabled?T.surf:bg,border:`1px solid ${disabled?T.b0:bdr}`,
+      color:disabled?T.dim:col,padding:small?"3px 8px":"8px 14px",
+      fontSize:small?8:9,letterSpacing:"0.18em",cursor:disabled?"not-allowed":"pointer",
+      borderRadius:2,transition:"all 0.15s",textTransform:"uppercase",whiteSpace:"nowrap",...style,
     }}>{children}</button>
   );
 }
@@ -728,77 +651,61 @@ function Btn({ children, onClick, disabled, ghost, danger, small, style = {} }) 
 // ══════════════════════════════════════════════════════════════════════════════
 // COMPONENT: Bubble
 // ──────────────────────────────────────────────────────────────────────────────
-// Renders a single message in the chat thread. Outbound messages align right
-// with a blue tint; inbound align left with a neutral dark background.
+// Single message bubble. Shows display_name in the metadata line.
+// Delete is own-messages-only, two-step (hover reveal → confirm).
 //
-// The delete button is hidden by default and revealed on hover (CSS opacity
-// transition via JS style mutation — avoids adding a hover stylesheet).
-// Clicking ✕ enters a confirm state; the second click calls onDelete.
-//
-// @prop msg       object  — local message object (see decodeRow)
-// @prop isMine    boolean — true if sender_id matches SESSION_ID
-// @prop onDelete  fn(dbId) — called after delete confirmation
+// @prop msg        — local message object (see decodeRow)
+// @prop isMine     — sender_id === SESSION_ID
+// @prop onDelete   — fn(dbId)
 // ══════════════════════════════════════════════════════════════════════════════
 
 function Bubble({ msg, isMine, onDelete }) {
-  const [confirmDel, setConfirmDel] = useState(false);
-  const failed = msg.status === "failed";
-  const bg     = isMine ? T.out  : T.inc;
-  const border = isMine ? T.outB : T.incB;
-  const align  = isMine ? "flex-end" : "flex-start";
+  const [confirmDel,setConfirmDel] = useState(false);
+  const failed=msg.status==="failed";
+  const bg    =isMine?T.out:T.inc;
+  const border=isMine?T.outB:T.incB;
+  const align =isMine?"flex-end":"flex-start";
+  // "you" for own messages, sender's display_name or "anon" for others
+  const nameLabel=isMine?"you":(msg.displayName||"anon");
 
-  return (
-    <div
-      style={{ display:"flex", flexDirection:"column", alignItems:align, marginBottom:14, animation:"fadeUp 0.2s ease", position:"relative" }}
-      onMouseEnter={e => { if (isMine) e.currentTarget.querySelector(".del-btn")?.style && (e.currentTarget.querySelector(".del-btn").style.opacity = 1); }}
-      onMouseLeave={e => { if (isMine) e.currentTarget.querySelector(".del-btn")?.style && (e.currentTarget.querySelector(".del-btn").style.opacity = 0); }}
-    >
-      {/* Delete button — only rendered for own messages, hidden until hover */}
-      {isMine && !confirmDel && (
-        <button
-          className="del-btn"
-          onClick={() => setConfirmDel(true)}
-          style={{
-            position:"absolute", top:-6, right:-6, width:18, height:18,
-            borderRadius:"50%", background:T.rd, border:`1px solid ${T.red}`,
-            color:T.red, fontSize:9, cursor:"pointer",
-            display:"flex", alignItems:"center", justifyContent:"center",
-            opacity:0, transition:"opacity 0.15s", zIndex:2, lineHeight:1,
-          }}
-        >✕</button>
+  return(
+    <div style={{display:"flex",flexDirection:"column",alignItems:align,marginBottom:14,animation:"fadeUp 0.2s ease",position:"relative"}}
+      onMouseEnter={e=>{if(isMine)e.currentTarget.querySelector(".del-btn")?.style&&(e.currentTarget.querySelector(".del-btn").style.opacity=1);}}
+      onMouseLeave={e=>{if(isMine)e.currentTarget.querySelector(".del-btn")?.style&&(e.currentTarget.querySelector(".del-btn").style.opacity=0);}}>
+
+      {/* Delete trigger — own messages only, hidden until hover */}
+      {isMine&&!confirmDel&&(
+        <button className="del-btn" onClick={()=>setConfirmDel(true)} style={{
+          position:"absolute",top:-6,right:-6,width:18,height:18,
+          borderRadius:"50%",background:T.rd,border:`1px solid ${T.red}`,
+          color:T.red,fontSize:9,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",
+          opacity:0,transition:"opacity 0.15s",zIndex:2,lineHeight:1,
+        }}>✕</button>
       )}
-
-      {/* Confirm-delete inline buttons */}
-      {isMine && confirmDel && (
-        <div style={{ display:"flex", gap:4, marginBottom:4, animation:"fadeUp 0.1s ease" }}>
-          <Btn small danger onClick={() => { onDelete(msg.dbId); setConfirmDel(false); }}>delete</Btn>
-          <Btn small ghost  onClick={() => setConfirmDel(false)}>cancel</Btn>
+      {isMine&&confirmDel&&(
+        <div style={{display:"flex",gap:4,marginBottom:4,animation:"fadeUp 0.1s ease"}}>
+          <Btn small danger onClick={()=>{onDelete(msg.dbId);setConfirmDel(false);}}>delete</Btn>
+          <Btn small ghost  onClick={()=>setConfirmDel(false)}>cancel</Btn>
         </div>
       )}
 
-      {/* Message body */}
-      <div style={{
-        maxWidth:"78%", minWidth:80, background:bg, border:`1px solid ${border}`,
-        // Asymmetric border radius signals direction: sender's tail is on the bottom
-        borderRadius: isMine ? "10px 10px 2px 10px" : "10px 10px 10px 2px",
-        padding:"10px 13px",
-      }}>
+      <div style={{maxWidth:"78%",minWidth:80,background:bg,border:`1px solid ${border}`,
+        borderRadius:isMine?"10px 10px 2px 10px":"10px 10px 10px 2px",padding:"10px 13px"}}>
         {failed
-          ? <div style={{ fontSize:11, color:T.red, lineHeight:1.6 }}>{msg.err}</div>
-          : <>
-              <div style={{ fontSize:13, color:T.bright, lineHeight:1.7, wordBreak:"break-word", whiteSpace:"pre-wrap" }}>
-                {/* Pretty-print JSON payloads; render everything else as plain text */}
-                {typeof msg.value === "object" ? JSON.stringify(msg.value, null, 2) : msg.value}
-              </div>
-              <CarrierThumb carrier={msg.carrier} mode={msg.mode} />
-            </>
+          ?<div style={{fontSize:11,color:T.red,lineHeight:1.6}}>{msg.err}</div>
+          :<>
+            <div style={{fontSize:13,color:T.bright,lineHeight:1.7,wordBreak:"break-word",whiteSpace:"pre-wrap"}}>
+              {typeof msg.value==="object"?JSON.stringify(msg.value,null,2):msg.value}
+            </div>
+            <CarrierThumb carrier={msg.carrier} mode={msg.mode}/>
+          </>
         }
       </div>
 
-      {/* Metadata line: timestamp · direction · encoding mode */}
-      <div style={{ fontSize:8, color:T.dim, marginTop:3, letterSpacing:"0.1em", paddingLeft:isMine?0:4, paddingRight:isMine?4:0 }}>
-        {fmtTime(msg.ts)} · {isMine ? "you" : "them"} · {(msg.mode || "?").toUpperCase()}
-        {failed && " · failed"}
+      {/* Metadata: time · name (colour-coded) · mode */}
+      <div style={{fontSize:8,color:T.dim,marginTop:3,letterSpacing:"0.1em",paddingLeft:isMine?0:4,paddingRight:isMine?4:0}}>
+        {fmtTime(msg.ts)} · <span style={{color:isMine?T.green:T.sub}}>{nameLabel}</span> · {(msg.mode||"?").toUpperCase()}
+        {failed&&" · failed"}
       </div>
     </div>
   );
@@ -808,441 +715,397 @@ function Bubble({ msg, isMine, onDelete }) {
 // ══════════════════════════════════════════════════════════════════════════════
 // COMPONENT: ChatView
 // ──────────────────────────────────────────────────────────────────────────────
-// Main chat interface. Owns the full message lifecycle for an active room:
-//   - Load history from Supabase on mount
-//   - Subscribe to Realtime INSERT/DELETE events
-//   - Encode + send outbound messages (optimistic UI)
+// Owns the full message lifecycle for an active room:
+//   - Load history on mount / manual reload
+//   - Realtime INSERT + DELETE subscription
+//   - Encode + send (with throttle, debounce, size cap)
 //   - Decode + display inbound messages
-//   - Handle carrier input via file picker, paste bar, drag-drop, global paste
-//   - Room wipe + leave confirmation
+//   - Carrier input: file picker, paste bar, drag-drop, global paste
+//   - Room TTL countdown + auto-expiry
+//   - Profile (display name) widget
+//   - Leave + room wipe
 //
-// @prop roomId      string — Supabase room_id
-// @prop mode        string — Enc.SVG | Enc.LSB (fixed for the room lifetime)
-// @prop passphrase  string — shared secret (never sent to the network)
-// @prop onLeave     fn()   — called after room wipe to return to Setup
+// @prop roomId      string
+// @prop mode        Enc.SVG | Enc.LSB
+// @prop passphrase  string (never leaves client memory)
+// @prop expiresAt   number (ms epoch) — from Supabase rooms table
+// @prop onLeave     fn()
 // ══════════════════════════════════════════════════════════════════════════════
 
-function ChatView({ roomId, mode, passphrase, onLeave }) {
-  const [msgs,     setMsgs]    = useState([]);
-  const [text,     setText]    = useState("");
-  const [busy,     setBusy]    = useState(false);   // send/receive in progress
-  const [loading,  setLoading] = useState(true);    // initial history load
-  const [error,    setError]   = useState(null);
-  const [dragOver, setDrag]    = useState(false);
-  const [pasteMode,setPaste]   = useState(false);   // paste-bar panel visible
-  const [pasteVal, setPasteVal]= useState("");
-  const [connState,setConn]    = useState("connecting"); // "connecting" | "live" | "error"
+function ChatView({ roomId, mode, passphrase, expiresAt, onLeave }) {
+  const [msgs,       setMsgs]      = useState([]);
+  const [text,       setText]      = useState("");
+  const [busy,       setBusy]      = useState(false);
+  const [loading,    setLoading]   = useState(true);
+  const [error,      setError]     = useState(null);
+  const [dragOver,   setDrag]      = useState(false);
+  const [pasteMode,  setPaste]     = useState(false);
+  const [pasteVal,   setPasteVal]  = useState("");
+  const [connState,  setConn]      = useState("connecting");
+  const [showProfile,setShowProfile] = useState(false);
+  const [throttleMsg,setThrottleMsg] = useState(null);
+  const [msgCount,   setMsgCount]  = useState(0);
 
-  const bottomRef   = useRef(); // scrolled-to on new messages
-  const textareaRef = useRef(); // checked in paste/send guards
-  const fileRef     = useRef(); // hidden file input for carrier upload
-
-  // Tracks when the tab last became visible. Used by the tab-switch guard to
-  // suppress sends/pastes that fire within 800ms of regaining focus.
+  const bottomRef    = useRef();
+  const textareaRef  = useRef();
+  const fileRef      = useRef();
   const lastVisibleRef = useRef(Date.now());
 
-  // ── Manual reload ───────────────────────────────────────────────────────────
-  // Re-fetches and re-decrypts the full message history without navigating away.
-  // Useful after a Realtime hiccup or when a participant joins mid-conversation.
-  const reload = useCallback(() => {
-    setLoading(true); setError(null);
-    dbLoad(roomId)
-      .then(async rows => {
-        const decoded = await Promise.all(rows.map(r => decodeRow(r, passphrase, mode)));
-        setMsgs(decoded.filter(Boolean));
-        setLoading(false);
-      })
-      .catch(e => { setError("Failed to load: " + e.message); setLoading(false); });
-  }, [roomId, passphrase, mode]);
+  // ── TTL expiry check ─────────────────────────────────────────────────────────
+  // Check every minute. If room has expired, wipe and return to Setup.
+  useEffect(()=>{
+    const check=()=>{
+      if(Date.now()>=expiresAt){ dbDeleteRoom(roomId).catch(()=>{}); onLeave(); }
+    };
+    check();
+    const id=setInterval(check,60_000);
+    return()=>clearInterval(id);
+  },[expiresAt]);
 
-  // ── Initial history load ────────────────────────────────────────────────────
-  useEffect(() => {
-    setLoading(true); setError(null);
+  // ── Load history ─────────────────────────────────────────────────────────────
+  const reload=useCallback(()=>{
+    setLoading(true);setError(null);
     dbLoad(roomId)
-      .then(async rows => {
-        const decoded = await Promise.all(rows.map(r => decodeRow(r, passphrase, mode)));
-        setMsgs(decoded.filter(Boolean));
-        setLoading(false);
+      .then(async rows=>{
+        setMsgCount(rows.length);
+        const decoded=await Promise.all(rows.map(r=>decodeRow(r,passphrase,mode)));
+        setMsgs(decoded.filter(Boolean));setLoading(false);
       })
-      .catch(e => { setError("Failed to load messages: " + e.message); setLoading(false); });
-  }, [roomId, passphrase]); // re-run if room or passphrase changes (shouldn't normally happen)
+      .catch(e=>{setError("Failed to load: "+e.message);setLoading(false);});
+  },[roomId,passphrase,mode]);
 
-  // ── Realtime subscription ───────────────────────────────────────────────────
-  useEffect(() => {
+  useEffect(()=>{
+    setLoading(true);setError(null);
+    dbLoad(roomId)
+      .then(async rows=>{
+        setMsgCount(rows.length);
+        const decoded=await Promise.all(rows.map(r=>decodeRow(r,passphrase,mode)));
+        setMsgs(decoded.filter(Boolean));setLoading(false);
+      })
+      .catch(e=>{setError("Failed to load messages: "+e.message);setLoading(false);});
+  },[roomId,passphrase]);
+
+  // ── Realtime subscription ────────────────────────────────────────────────────
+  useEffect(()=>{
     setConn("connecting");
-    const unsub = dbSubscribe(
-      roomId,
-      async row => {
-        // Skip own inserts — we already rendered them optimistically in send()
-        if (row.sender_id === SESSION_ID) return;
-        const m = await decodeRow(row, passphrase, mode);
-        if (m) setMsgs(prev => [...prev, m]);
+    const unsub=dbSubscribe(roomId,
+      async row=>{
+        if(row.sender_id===SESSION_ID)return; // skip own (already optimistic)
+        const m=await decodeRow(row,passphrase,mode);
+        if(m){setMsgs(prev=>[...prev,m]);setMsgCount(c=>c+1);}
         setConn("live");
       },
-      id => {
-        // Remove the deleted message from local state immediately
-        setMsgs(prev => prev.filter(m => m.dbId !== id));
-      }
+      id=>{setMsgs(prev=>prev.filter(m=>m.dbId!==id));setMsgCount(c=>Math.max(0,c-1));}
     );
-    // Assume connected after 2 seconds if no error — Supabase doesn't emit a
-    // "connected" event, so we optimistically flip the status indicator.
-    const t = setTimeout(() => setConn("live"), 2000);
-    return () => { unsub(); clearTimeout(t); };
-  }, [roomId, passphrase]);
+    const t=setTimeout(()=>setConn("live"),2000);
+    return()=>{unsub();clearTimeout(t);};
+  },[roomId,passphrase]);
 
-  // ── Auto-scroll ─────────────────────────────────────────────────────────────
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
+  // ── Auto-scroll ──────────────────────────────────────────────────────────────
+  useEffect(()=>{bottomRef.current?.scrollIntoView({behavior:"smooth"});},[msgs]);
 
-  // ── Tab-switch guard ────────────────────────────────────────────────────────
-  // When the user switches away and back, browser focus restoration can trigger
-  // stale Enter keypress events on the textarea. We blur the textarea on hide
-  // and record the visibility timestamp. Any send fired within 800ms of becoming
-  // visible is treated as a stale event and ignored.
-  useEffect(() => {
-    const handler = () => {
-      if (document.visibilityState === "visible") {
-        lastVisibleRef.current = Date.now();
-        if (document.activeElement === textareaRef.current) {
-          textareaRef.current.blur(); // prevent stale submit on re-focus
-        }
+  // ── Tab-switch guard ─────────────────────────────────────────────────────────
+  useEffect(()=>{
+    const handler=()=>{
+      if(document.visibilityState==="visible"){
+        lastVisibleRef.current=Date.now();
+        if(document.activeElement===textareaRef.current) textareaRef.current.blur();
       }
     };
-    document.addEventListener("visibilitychange", handler);
-    return () => document.removeEventListener("visibilitychange", handler);
-  }, []);
+    document.addEventListener("visibilitychange",handler);
+    return()=>document.removeEventListener("visibilitychange",handler);
+  },[]);
 
-  // ── Global paste handler ────────────────────────────────────────────────────
-  // Intercepts Ctrl+V / ⌘+V anywhere outside the text input to receive carriers.
-  // Priority: image blob > text (data URL or base64 string).
-  const handlePaste = useCallback(e => {
-    if (document.activeElement === textareaRef.current) return; // let textarea handle its own paste
-    if (Date.now() - lastVisibleRef.current < 800) return;      // tab-switch stale guard
-    const items = Array.from(e.clipboardData?.items ?? []);
-    const img   = items.find(i => i.type.startsWith("image/"));
-    if (img) { receiveFile(img.getAsFile()); return; }
-    const txt = items.find(i => i.kind === "string");
-    if (txt) txt.getAsString(s => { const u = toDataUrl(s); if (u) receiveCarrier(u); });
-  }, [passphrase, mode]);
+  // ── Global paste ─────────────────────────────────────────────────────────────
+  const handlePaste=useCallback(e=>{
+    if(document.activeElement===textareaRef.current)return;
+    if(Date.now()-lastVisibleRef.current<800)return;
+    const items=Array.from(e.clipboardData?.items??[]);
+    const img=items.find(i=>i.type.startsWith("image/"));
+    if(img){receiveFile(img.getAsFile());return;}
+    const txt=items.find(i=>i.kind==="string");
+    if(txt)txt.getAsString(s=>{const u=toDataUrl(s);if(u)receiveCarrier(u);});
+  },[passphrase,mode]);
 
-  useEffect(() => {
-    document.addEventListener("paste", handlePaste);
-    return () => document.removeEventListener("paste", handlePaste);
-  }, [handlePaste]);
+  useEffect(()=>{
+    document.addEventListener("paste",handlePaste);
+    return()=>document.removeEventListener("paste",handlePaste);
+  },[handlePaste]);
 
-  // ── decodeRow ───────────────────────────────────────────────────────────────
-  // Converts a raw Supabase message row into a local message object.
-  // Decryption happens here — this is why passphrase never touches the network.
-  // @returns  local message object, or the object with status:"failed" on bad decrypt
-  async function decodeRow(row, pass, expectedMode) {
-    const raw    = await Codec.decode(row.carrier, pass);
-    const isMine = row.sender_id === SESSION_ID;
-    return {
-      dbId:     row.id,
-      localId:  `local_${row.id}`,
-      dir:      isMine ? "out" : "in",
-      status:   raw ? "decoded" : "failed",
-      mode:     row.mode || expectedMode, // fall back to room mode if column is missing
-      carrier:  row.carrier,
-      value:    raw,
-      err:      raw ? null : "decryption failed — wrong key or different mode",
-      ts:       new Date(row.ts).getTime(),
-      senderId: row.sender_id,
+  // ── Close profile on outside click ──────────────────────────────────────────
+  useEffect(()=>{
+    if(!showProfile)return;
+    const handler=e=>{
+      if(!e.target.closest(".profile-widget")&&!e.target.closest(".profile-btn"))
+        setShowProfile(false);
+    };
+    document.addEventListener("mousedown",handler);
+    return()=>document.removeEventListener("mousedown",handler);
+  },[showProfile]);
+
+  // ── decodeRow ────────────────────────────────────────────────────────────────
+  // Converts a raw Supabase row into a local message object.
+  // Decryption happens entirely here — passphrase never touches the network.
+  async function decodeRow(row,pass,expectedMode){
+    const raw=await Codec.decode(row.carrier,pass);
+    const isMine=row.sender_id===SESSION_ID;
+    return{
+      dbId:row.id, localId:`local_${row.id}`,
+      dir:isMine?"out":"in",
+      status:raw?"decoded":"failed",
+      mode:row.mode||expectedMode,
+      carrier:row.carrier,
+      value:raw,
+      displayName:row.display_name||null,
+      err:raw?null:"decryption failed — wrong key or different mode",
+      ts:new Date(row.ts).getTime(),
+      senderId:row.sender_id,
     };
   }
 
-  // ── send ────────────────────────────────────────────────────────────────────
+  // ── send ─────────────────────────────────────────────────────────────────────
   // @flow
-  //   1. Encode plaintext into an encrypted carrier image (local, no network).
-  //   2. Insert an optimistic local message immediately so the UI feels instant.
-  //   3. Post the carrier to Supabase.
-  //   4. Patch the optimistic message with the real DB id (needed for delete).
-  //   5. Other participants receive the INSERT via Realtime and decrypt locally.
-  const send = async () => {
-    const t = text.trim();
-    if (!t || busy) return;
-    if (Date.now() - lastVisibleRef.current < 800) return; // tab-switch stale guard
-    setBusy(true); setText("");
-    try {
-      const carrier   = await Codec.encode(t, passphrase, mode);
-      const optimistic = {
-        dbId: null, localId: `opt_${Date.now()}`,
-        dir: "out", status: "encoded", mode, carrier, value: t,
-        err: null, ts: Date.now(), senderId: SESSION_ID,
+  //   1. Sanitize + validate plaintext (length, chars)
+  //   2. Throttle check (1 msg/sec), room cap check (500 msgs)
+  //   3. Encode into carrier (local crypto — no network)
+  //   4. Validate carrier size
+  //   5. Optimistic local insert (instant UI)
+  //   6. POST to Supabase → patch optimistic with real DB id
+  const send=async()=>{
+    const sanity=sanitizeMessage(text);
+    if(!sanity.ok||busy)return;
+    if(Date.now()-lastVisibleRef.current<800)return;
+
+    if(!canSendNow()){
+      setThrottleMsg("slow down — 1 message per second");
+      setTimeout(()=>setThrottleMsg(null),1500);
+      return;
+    }
+    if(msgCount>=MAX_ROOM_MESSAGES){
+      setThrottleMsg(`room is full (max ${MAX_ROOM_MESSAGES} messages)`);
+      setTimeout(()=>setThrottleMsg(null),3000);
+      return;
+    }
+
+    setBusy(true);setText("");recordSend();
+    try{
+      const carrier=await Codec.encode(sanity.value,passphrase,mode);
+      const cv=validateCarrier(carrier);
+      if(!cv.ok) throw new Error(cv.err);
+
+      const username=getUsername();
+      const optimistic={
+        dbId:null,localId:`opt_${Date.now()}`,
+        dir:"out",status:"encoded",mode,carrier,
+        value:sanity.value,displayName:username,
+        err:null,ts:Date.now(),senderId:SESSION_ID,
       };
-      setMsgs(prev => [...prev, optimistic]); // show immediately (optimistic)
-      const dbId = await dbPost(roomId, carrier, mode, SESSION_ID);
-      // Patch the optimistic entry with the real DB id so deletes work
-      setMsgs(prev => prev.map(m => m.localId === optimistic.localId ? { ...m, dbId } : m));
-    } catch (e) {
-      setMsgs(prev => [...prev, {
-        dbId: null, localId: `err_${Date.now()}`,
-        dir: "out", status: "failed", mode,
-        carrier: null, value: null, err: "send failed: " + e.message,
-        ts: Date.now(), senderId: SESSION_ID,
+      setMsgs(prev=>[...prev,optimistic]);
+      setMsgCount(c=>c+1);
+      const dbId=await dbPost(roomId,carrier,mode,SESSION_ID,username);
+      setMsgs(prev=>prev.map(m=>m.localId===optimistic.localId?{...m,dbId}:m));
+    }catch(e){
+      setMsgs(prev=>[...prev,{
+        dbId:null,localId:`err_${Date.now()}`,dir:"out",status:"failed",
+        mode,carrier:null,value:null,displayName:null,
+        err:"send failed: "+e.message,ts:Date.now(),senderId:SESSION_ID,
       }]);
-    } finally { setBusy(false); }
+    }finally{setBusy(false);}
   };
 
-  // ── receiveCarrier ──────────────────────────────────────────────────────────
-  // Decodes and displays a carrier that was obtained outside the Realtime stream
-  // (paste, file drop, paste bar). These messages are display-only — they have
-  // no dbId and cannot be deleted (they exist only in this tab's local state).
-  const receiveCarrier = async (url) => {
-    if (!url) return;
+  // Debounced send — prevents double-fire on rapid Enter key presses
+  const debouncedSend=useCallback(debounce(send,SEND_DEBOUNCE_MS),[text,busy,passphrase,mode,msgCount]);
+
+  // ── receiveCarrier (local decode — paste / drop / file, no DB) ───────────────
+  const receiveCarrier=async(url)=>{
+    if(!url)return;
+    const cv=validateCarrier(url);
+    if(!cv.ok){console.warn("carrier rejected:",cv.err);return;}
     setBusy(true);
-    try {
-      const raw = await Codec.decode(url, passphrase);
-      setMsgs(prev => [...prev, {
-        dbId: null, localId: `recv_${Date.now()}`,
-        dir: "in",
-        status:   raw ? "decoded" : "failed",
-        mode:     Codec.sniff(url),
-        carrier:  url,
-        value:    raw,
-        err:      raw ? null : "decryption failed — wrong key or no payload",
-        ts:       Date.now(),
-        senderId: "external", // not a SESSION_ID — came from outside the room
+    try{
+      const raw=await Codec.decode(url,passphrase);
+      setMsgs(prev=>[...prev,{
+        dbId:null,localId:`recv_${Date.now()}`,dir:"in",
+        status:raw?"decoded":"failed",mode:Codec.sniff(url),
+        carrier:url,value:raw,displayName:null,
+        err:raw?null:"decryption failed — wrong key or no payload",
+        ts:Date.now(),senderId:"external",
       }]);
-    } finally { setBusy(false); }
+    }finally{setBusy(false);}
   };
 
-  // Reads a File object as a data URL, then passes to receiveCarrier
-  const receiveFile = (file) => {
-    const r = new FileReader();
-    r.onload = e => receiveCarrier(e.target.result);
-    r.readAsDataURL(file);
-  };
+  const receiveFile=(file)=>{const r=new FileReader();r.onload=e=>receiveCarrier(e.target.result);r.readAsDataURL(file);};
 
-  // ── deleteMsg ───────────────────────────────────────────────────────────────
-  // Hard-deletes from Supabase. The Realtime DELETE event will propagate to all
-  // other connected participants and remove it from their local state too.
-  const deleteMsg = async (dbId) => {
-    if (!dbId) return; // optimistic/external messages have no dbId — can't delete
-    try {
+  // ── deleteMsg ────────────────────────────────────────────────────────────────
+  const deleteMsg=async(dbId)=>{
+    if(!dbId)return;
+    try{
       await dbDelete(dbId);
-      setMsgs(prev => prev.filter(m => m.dbId !== dbId));
-    } catch (e) { console.error("delete failed", e); }
+      setMsgs(prev=>prev.filter(m=>m.dbId!==dbId));
+      setMsgCount(c=>Math.max(0,c-1));
+    }catch(e){console.error("delete failed",e);}
   };
 
-  // ── shareUrl ────────────────────────────────────────────────────────────────
-  // Copies the current URL (room + mode in query string) to clipboard.
-  // The passphrase is never included.
-  const shareUrl = () => {
+  const shareUrl=()=>{
     navigator.clipboard?.writeText(window.location.href)
-      .then(() => alert("Room URL copied!\n\nShare it — the other party will be prompted for the passphrase."));
+      .then(()=>alert("Room URL copied!\n\nShare it — the other party will be prompted for the passphrase."));
   };
 
-  // ── Leave confirmation + room wipe ──────────────────────────────────────────
-  // Two-step: first click shows the modal, second click wipes + leaves.
-  // dbDeleteRoom removes all messages for this room_id from Supabase.
-  // The Realtime DELETE events propagate to other tabs, which will see their
-  // message list empty and — on next interaction — return to Setup.
-  const [leaveConfirm, setLeaveConfirm] = useState(false);
-  const handleLeave  = () => setLeaveConfirm(true);
-  const confirmLeave = async () => {
-    try { await dbDeleteRoom(roomId); } catch (e) { console.error("room wipe failed", e); }
-    setLeaveConfirm(false);
-    onLeave();
+  // ── Leave / room wipe ────────────────────────────────────────────────────────
+  const [leaveConfirm,setLeaveConfirm]=useState(false);
+  const confirmLeave=async()=>{
+    try{await dbDeleteRoom(roomId);}catch(e){console.error("wipe failed",e);}
+    setLeaveConfirm(false);onLeave();
   };
 
-  // Map connection state string → indicator colour
-  const connColor = { connecting: T.amber, live: T.green, error: T.red }[connState] ?? T.dim;
+  const connColor={connecting:T.amber,live:T.green,error:T.red}[connState]??T.dim;
+  const atCap=msgCount>=MAX_ROOM_MESSAGES;
 
-  return (
-    <div style={{ height:"100%", display:"flex", flexDirection:"column", background:T.bg }}>
+  return(
+    <div style={{height:"100%",display:"flex",flexDirection:"column",background:T.bg,position:"relative"}}>
 
-      {/* ── Header bar ── */}
-      <div style={{ background:T.raised, borderBottom:`1px solid ${T.b0}`, padding:"8px 12px", display:"flex", alignItems:"center", gap:8, flexShrink:0, minWidth:0 }}>
-        {/* Abbreviated wordmark — full "Stegoframe" won't fit on mobile */}
-        <div style={{ fontFamily:DISP, fontSize:14, fontWeight:800, color:T.white, letterSpacing:"0.05em", flexShrink:0 }}>
-          SF<span style={{ color:T.green }}>·</span>
+      {/* ── Header ── */}
+      <div style={{background:T.raised,borderBottom:`1px solid ${T.b0}`,padding:"8px 12px",display:"flex",alignItems:"center",gap:8,flexShrink:0,minWidth:0}}>
+        <div style={{fontFamily:DISP,fontSize:14,fontWeight:800,color:T.white,letterSpacing:"0.05em",flexShrink:0}}>
+          SF<span style={{color:T.green}}>·</span>
         </div>
-        {/* Room code — truncates with ellipsis if the header is too narrow */}
-        <span style={{ fontSize:9, color:T.muted, letterSpacing:"0.15em", fontFamily:MONO, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", minWidth:0 }}>
+        {/* Room code truncates on narrow screens */}
+        <span style={{fontSize:9,color:T.muted,letterSpacing:"0.15em",fontFamily:MONO,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",minWidth:0}}>
           #{roomId}
         </span>
-        <span style={{ fontSize:8, color:T.dim, letterSpacing:"0.15em", flexShrink:0 }}>{mode.toUpperCase()}</span>
-        {/* Connection status dot: amber=connecting, green=live, red=error */}
-        <span
-          title={connState}
-          style={{ width:5, height:5, borderRadius:"50%", background:connColor, display:"inline-block", flexShrink:0, animation:connState==="connecting"?"pulse 1s infinite":"none" }}
-        />
-        {/* Action buttons — fixed 30×30 icon buttons to save horizontal space */}
-        <div style={{ marginLeft:"auto", display:"flex", gap:6, flexShrink:0 }}>
-          {/* ↻ Reload: re-fetches history, spins while loading */}
-          <button onClick={reload} title="reload messages" style={{
-            background:"transparent", border:`1px solid ${T.b1}`, color:T.sub,
-            width:30, height:30, cursor:"pointer", borderRadius:2, fontSize:13,
-            display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0,
-            animation: loading ? "spin 0.8s linear infinite" : "none",
-          }}>↻</button>
-          {/* ⎗ Share: copies room URL to clipboard */}
-          <button onClick={shareUrl} title="copy room url" style={{
-            background:"transparent", border:`1px solid ${T.b1}`, color:T.sub,
-            width:30, height:30, cursor:"pointer", borderRadius:2, fontSize:13,
-            display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0,
-          }}>⎗</button>
-          {/* ⏻ Leave: triggers confirm modal */}
-          <button onClick={handleLeave} title="leave room" style={{
-            background:T.rd, border:`1px solid ${T.red}`, color:T.red,
-            width:30, height:30, cursor:"pointer", borderRadius:2, fontSize:13,
-            display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0,
-          }}>⏻</button>
+        <span style={{fontSize:8,color:T.dim,letterSpacing:"0.15em",flexShrink:0}}>{mode.toUpperCase()}</span>
+        {/* Connection dot: amber=connecting, green=live, red=error */}
+        <span title={connState} style={{width:5,height:5,borderRadius:"50%",background:connColor,display:"inline-block",flexShrink:0,animation:connState==="connecting"?"pulse 1s infinite":"none"}}/>
+        {/* TTL countdown — colour shifts as expiry approaches */}
+        <CountdownBadge expiresAt={expiresAt}/>
+        <div style={{marginLeft:"auto",display:"flex",gap:6,flexShrink:0}}>
+          {/* ↻ Reload */}
+          <button onClick={reload} title="reload messages" style={{background:"transparent",border:`1px solid ${T.b1}`,color:T.sub,width:30,height:30,cursor:"pointer",borderRadius:2,fontSize:13,display:"flex",alignItems:"center",justifyContent:"center",animation:loading?"spin 0.8s linear infinite":"none"}}>↻</button>
+          {/* ✎ Profile widget toggle */}
+          <button className="profile-btn" onClick={()=>setShowProfile(v=>!v)} title="set display name" style={{background:showProfile?T.gd:"transparent",border:`1px solid ${showProfile?T.green:T.b1}`,color:showProfile?T.green:T.sub,width:30,height:30,cursor:"pointer",borderRadius:2,fontSize:13,display:"flex",alignItems:"center",justifyContent:"center"}}>✎</button>
+          {/* ⎗ Share URL */}
+          <button onClick={shareUrl} title="copy room url" style={{background:"transparent",border:`1px solid ${T.b1}`,color:T.sub,width:30,height:30,cursor:"pointer",borderRadius:2,fontSize:13,display:"flex",alignItems:"center",justifyContent:"center"}}>⎗</button>
+          {/* ⏻ Leave + wipe */}
+          <button onClick={()=>setLeaveConfirm(true)} title="leave room" style={{background:T.rd,border:`1px solid ${T.red}`,color:T.red,width:30,height:30,cursor:"pointer",borderRadius:2,fontSize:13,display:"flex",alignItems:"center",justifyContent:"center"}}>⏻</button>
         </div>
       </div>
 
+      {/* Profile widget — absolute overlay below header */}
+      {showProfile&&(
+        <div className="profile-widget" style={{position:"absolute",top:0,left:0,right:0,zIndex:99}}>
+          <ProfileWidget onClose={()=>setShowProfile(false)}/>
+        </div>
+      )}
+
       {/* ── Message thread ── */}
-      <div
-        style={{ flex:1, overflowY:"auto", padding:"16px 16px 4px", display:"flex", flexDirection:"column" }}
-        onDragOver={e  => { e.preventDefault(); setDrag(true); }}
-        onDragLeave={() => setDrag(false)}
-        onDrop={e => {
-          e.preventDefault(); setDrag(false);
-          const f = e.dataTransfer.files[0];
-          if (f) receiveFile(f);
-          else { const u = toDataUrl(e.dataTransfer.getData("text")); if (u) receiveCarrier(u); }
-        }}
-      >
+      <div style={{flex:1,overflowY:"auto",padding:"16px 16px 4px",display:"flex",flexDirection:"column"}}
+        onDragOver={e=>{e.preventDefault();setDrag(true);}}
+        onDragLeave={()=>setDrag(false)}
+        onDrop={e=>{e.preventDefault();setDrag(false);const f=e.dataTransfer.files[0];if(f)receiveFile(f);else{const u=toDataUrl(e.dataTransfer.getData("text"));if(u)receiveCarrier(u);}}}>
+
         {/* Full-screen drop overlay */}
-        {dragOver && (
-          <div style={{ position:"fixed", inset:0, background:"rgba(29,255,143,0.04)", border:`2px dashed ${T.green}`, zIndex:50, display:"flex", alignItems:"center", justifyContent:"center", pointerEvents:"none" }}>
-            <span style={{ fontSize:11, color:T.green, letterSpacing:"0.3em" }}>DROP CARRIER</span>
+        {dragOver&&(
+          <div style={{position:"fixed",inset:0,background:"rgba(29,255,143,0.04)",border:`2px dashed ${T.green}`,zIndex:50,display:"flex",alignItems:"center",justifyContent:"center",pointerEvents:"none"}}>
+            <span style={{fontSize:11,color:T.green,letterSpacing:"0.3em"}}>DROP CARRIER</span>
           </div>
         )}
 
-        {/* Loading spinner (initial history fetch) */}
-        {loading && (
-          <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center" }}>
-            <div style={{ width:16, height:16, border:`2px solid ${T.b1}`, borderTopColor:T.green, borderRadius:"50%", animation:"spin 0.8s linear infinite" }}/>
+        {loading&&(
+          <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <div style={{width:16,height:16,border:`2px solid ${T.b1}`,borderTopColor:T.green,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/>
+          </div>
+        )}
+        {!loading&&error&&<div style={{padding:16,color:T.red,fontSize:10,letterSpacing:"0.1em",lineHeight:1.6}}>{error}</div>}
+        {!loading&&!error&&msgs.length===0&&(
+          <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8,opacity:0.3}}>
+            <div style={{fontSize:10,letterSpacing:"0.3em",color:T.muted}}>NO TRANSMISSIONS</div>
+            <div style={{fontSize:8,letterSpacing:"0.2em",color:T.dim}}>type a message to begin</div>
           </div>
         )}
 
-        {!loading && error && (
-          <div style={{ padding:16, color:T.red, fontSize:10, letterSpacing:"0.1em", lineHeight:1.6 }}>{error}</div>
-        )}
-
-        {!loading && !error && msgs.length === 0 && (
-          <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:8, opacity:0.3 }}>
-            <div style={{ fontSize:10, letterSpacing:"0.3em", color:T.muted }}>NO TRANSMISSIONS</div>
-            <div style={{ fontSize:8,  letterSpacing:"0.2em", color:T.dim  }}>type a message to begin</div>
+        {/* Room-at-capacity warning */}
+        {atCap&&!loading&&(
+          <div style={{padding:"8px 12px",background:T.ad,border:`1px solid ${T.amber}`,borderRadius:2,marginBottom:10,fontSize:9,color:T.amber,letterSpacing:"0.1em"}}>
+            room is at capacity ({MAX_ROOM_MESSAGES} messages) — delete messages to send more
           </div>
         )}
 
-        {/* Use localId as key — it's always present, even before a dbId is assigned */}
-        {!loading && msgs.map(m => (
-          <Bubble
-            key={m.localId || m.dbId}
-            msg={m}
-            isMine={m.senderId === SESSION_ID}
-            onDelete={deleteMsg}
-          />
+        {/* localId used as key — stable even before dbId is assigned */}
+        {!loading&&msgs.map(m=>(
+          <Bubble key={m.localId||m.dbId} msg={m} isMine={m.senderId===SESSION_ID} onDelete={deleteMsg}/>
         ))}
-        {/* Invisible anchor element — scrollIntoView targets this on new messages */}
-        <div ref={bottomRef} />
+        <div ref={bottomRef}/>
       </div>
 
-      {/* ── Paste carrier bar (toggleable via ⌗ button) ── */}
-      {pasteMode && (
-        <div style={{ padding:"8px 12px", background:T.surf, borderTop:`1px solid ${T.b0}`, flexShrink:0, animation:"fadeUp 0.15s ease" }}>
-          <div style={{ fontSize:8, color:T.muted, letterSpacing:"0.2em", marginBottom:6, textTransform:"uppercase" }}>
-            paste carrier · data url or base64
-          </div>
-          <div style={{ display:"flex", gap:6 }}>
-            <input
-              value={pasteVal}
-              onChange={e => setPasteVal(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === "Enter") {
-                  const u = toDataUrl(pasteVal.trim());
-                  if (u) { receiveCarrier(u); setPasteVal(""); setPaste(false); }
-                }
-                if (e.key === "Escape") { setPaste(false); setPasteVal(""); }
-              }}
-              placeholder="data:image/... or bare base64"
-              autoFocus
-              style={{ flex:1, background:T.raised, border:`1px solid ${T.b1}`, color:T.bright, padding:"8px 10px", fontSize:11, outline:"none", borderRadius:2 }}
+      {/* ── Paste carrier bar (toggleable) ── */}
+      {pasteMode&&(
+        <div style={{padding:"8px 12px",background:T.surf,borderTop:`1px solid ${T.b0}`,flexShrink:0,animation:"fadeUp 0.15s ease"}}>
+          <div style={{fontSize:8,color:T.muted,letterSpacing:"0.2em",marginBottom:6,textTransform:"uppercase"}}>paste carrier · data url or base64</div>
+          <div style={{display:"flex",gap:6}}>
+            <input value={pasteVal} onChange={e=>setPasteVal(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter"){const u=toDataUrl(pasteVal.trim());if(u){receiveCarrier(u);setPasteVal("");setPaste(false);}}if(e.key==="Escape"){setPaste(false);setPasteVal("");}}}
+              placeholder="data:image/... or bare base64" autoFocus
+              style={{flex:1,background:T.raised,border:`1px solid ${T.b1}`,color:T.bright,padding:"8px 10px",fontSize:11,outline:"none",borderRadius:2}}
             />
-            <Btn onClick={() => { const u = toDataUrl(pasteVal.trim()); if (u) { receiveCarrier(u); setPasteVal(""); setPaste(false); } }}>→</Btn>
-            <Btn ghost onClick={() => { setPaste(false); setPasteVal(""); }}>✕</Btn>
+            <Btn onClick={()=>{const u=toDataUrl(pasteVal.trim());if(u){receiveCarrier(u);setPasteVal("");setPaste(false);}}}>→</Btn>
+            <Btn ghost onClick={()=>{setPaste(false);setPasteVal("");}}>✕</Btn>
           </div>
         </div>
       )}
 
-      {/* ── Compose bar ── */}
-      <div style={{ background:T.raised, borderTop:`1px solid ${T.b0}`, padding:"10px 12px", flexShrink:0, display:"flex", gap:8, alignItems:"flex-end" }}>
-
-        {/* Stacked carrier input buttons */}
-        <div style={{ display:"flex", flexDirection:"column", gap:4, flexShrink:0 }}>
-          {/* ⊕ File picker — opens OS file chooser for carrier images */}
-          <button onClick={() => fileRef.current?.click()} title="upload carrier file" style={{
-            background:"transparent", border:`1px solid ${T.b1}`, color:T.muted,
-            width:34, height:34, cursor:"pointer", borderRadius:2, fontSize:15,
-            display:"flex", alignItems:"center", justifyContent:"center",
-          }}>⊕</button>
-          {/* ⌗ Paste bar toggle — for pasting data URLs or bare base64 strings */}
-          <button onClick={() => setPaste(v => !v)} title="paste carrier base64" style={{
-            background:  pasteMode ? T.gd   : "transparent",
-            border:      `1px solid ${pasteMode ? T.green : T.b1}`,
-            color:       pasteMode ? T.green : T.muted,
-            width:34, height:34, cursor:"pointer", borderRadius:2, fontSize:13,
-            display:"flex", alignItems:"center", justifyContent:"center",
-          }}>⌗</button>
+      {/* Throttle / cap notice bar */}
+      {throttleMsg&&(
+        <div style={{padding:"6px 12px",background:T.ad,borderTop:`1px solid ${T.amber}`,fontSize:9,color:T.amber,letterSpacing:"0.1em",flexShrink:0}}>
+          {throttleMsg}
         </div>
+      )}
 
-        {/* Hidden file input — triggered by the ⊕ button */}
-        <input
-          ref={fileRef} type="file" accept="image/*,.svg" style={{ display:"none" }}
-          onChange={e => { if (e.target.files[0]) receiveFile(e.target.files[0]); e.target.value = ""; }}
+      {/* Char counter — appears at 80% of limit */}
+      {text.length>MAX_MSG_CHARS*0.8&&(
+        <div style={{padding:"3px 12px",background:T.surf,fontSize:8,color:text.length>=MAX_MSG_CHARS?T.red:T.amber,letterSpacing:"0.1em",flexShrink:0,textAlign:"right"}}>
+          {text.length}/{MAX_MSG_CHARS}
+        </div>
+      )}
+
+      {/* ── Compose bar ── */}
+      <div style={{background:T.raised,borderTop:`1px solid ${T.b0}`,padding:"10px 12px",flexShrink:0,display:"flex",gap:8,alignItems:"flex-end"}}>
+        <div style={{display:"flex",flexDirection:"column",gap:4,flexShrink:0}}>
+          {/* ⊕ File picker */}
+          <button onClick={()=>fileRef.current?.click()} title="upload carrier file" style={{background:"transparent",border:`1px solid ${T.b1}`,color:T.muted,width:34,height:34,cursor:"pointer",borderRadius:2,fontSize:15,display:"flex",alignItems:"center",justifyContent:"center"}}>⊕</button>
+          {/* ⌗ Paste bar toggle */}
+          <button onClick={()=>setPaste(v=>!v)} title="paste carrier base64" style={{background:pasteMode?T.gd:"transparent",border:`1px solid ${pasteMode?T.green:T.b1}`,color:pasteMode?T.green:T.muted,width:34,height:34,cursor:"pointer",borderRadius:2,fontSize:13,display:"flex",alignItems:"center",justifyContent:"center"}}>⌗</button>
+        </div>
+        <input ref={fileRef} type="file" accept="image/*,.svg" style={{display:"none"}}
+          onChange={e=>{if(e.target.files[0])receiveFile(e.target.files[0]);e.target.value="";}}/>
+        {/* Auto-resizing textarea, hard-capped at MAX_MSG_CHARS */}
+        <textarea ref={textareaRef} value={text}
+          onChange={e=>{if(e.target.value.length<=MAX_MSG_CHARS)setText(e.target.value);e.target.style.height="auto";e.target.style.height=Math.min(e.target.scrollHeight,120)+"px";}}
+          onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();debouncedSend();}}}
+          placeholder="type a message…" rows={1} disabled={busy||atCap}
+          style={{flex:1,background:T.surf,border:`1px solid ${T.b0}`,color:T.bright,padding:"9px 12px",fontSize:13,outline:"none",borderRadius:6,lineHeight:1.6,resize:"none",minHeight:38,maxHeight:120,overflow:"auto"}}
         />
-
-        {/* Text compose field — auto-grows up to 120px tall */}
-        <textarea
-          ref={textareaRef}
-          value={text}
-          onChange={e => {
-            setText(e.target.value);
-            e.target.style.height = "auto";
-            e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
-          }}
-          onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-          placeholder="type a message…"
-          rows={1}
-          disabled={busy}
-          style={{ flex:1, background:T.surf, border:`1px solid ${T.b0}`, color:T.bright, padding:"9px 12px", fontSize:13, outline:"none", borderRadius:6, lineHeight:1.6, resize:"none", minHeight:38, maxHeight:120, overflow:"auto" }}
-        />
-
-        {/* Send button — disabled when empty or mid-request */}
-        <button
-          onClick={send}
-          disabled={!text.trim() || busy}
-          style={{
-            background: (!text.trim() || busy) ? T.surf : T.gd,
-            border:     `1px solid ${(!text.trim() || busy) ? T.b1 : T.green}`,
-            color:      (!text.trim() || busy) ? T.dim  : T.green,
-            width:38, height:38, borderRadius:2, fontSize:16, flexShrink:0,
-            cursor:     (!text.trim() || busy) ? "not-allowed" : "pointer",
-            transition: "all 0.15s", display:"flex", alignItems:"center", justifyContent:"center",
-          }}
-        >{busy ? "…" : "↑"}</button>
+        <button onClick={debouncedSend} disabled={!text.trim()||busy||atCap} style={{
+          background:(!text.trim()||busy||atCap)?T.surf:T.gd,
+          border:`1px solid ${(!text.trim()||busy||atCap)?T.b1:T.green}`,
+          color:(!text.trim()||busy||atCap)?T.dim:T.green,
+          width:38,height:38,borderRadius:2,fontSize:16,flexShrink:0,
+          cursor:(!text.trim()||busy||atCap)?"not-allowed":"pointer",
+          transition:"all 0.15s",display:"flex",alignItems:"center",justifyContent:"center",
+        }}>{busy?"…":"↑"}</button>
       </div>
 
       {/* ── Leave confirmation modal ── */}
-      {leaveConfirm && (
-        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
-          <div style={{ background:T.surf, border:`1px solid ${T.red}`, borderRadius:4, padding:24, maxWidth:340, width:"100%", animation:"fadeUp 0.2s ease" }}>
-            <div style={{ fontSize:11, color:T.red, letterSpacing:"0.2em", textTransform:"uppercase", marginBottom:10 }}>leave room?</div>
-            <div style={{ fontSize:12, color:T.txt, lineHeight:1.8, marginBottom:20 }}>
-              This will <strong style={{ color:T.bright }}>permanently delete all messages</strong> in room{" "}
-              <strong style={{ color:T.bright }}>#{roomId}</strong> from the database for all participants.
-              This cannot be undone.
+      {leaveConfirm&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{background:T.surf,border:`1px solid ${T.red}`,borderRadius:4,padding:24,maxWidth:340,width:"100%",animation:"fadeUp 0.2s ease"}}>
+            <div style={{fontSize:11,color:T.red,letterSpacing:"0.2em",textTransform:"uppercase",marginBottom:10}}>leave room?</div>
+            <div style={{fontSize:12,color:T.txt,lineHeight:1.8,marginBottom:20}}>
+              This will <strong style={{color:T.bright}}>permanently delete all messages</strong> in room{" "}
+              <strong style={{color:T.bright}}>#{roomId}</strong> for all participants. Cannot be undone.
             </div>
-            <div style={{ display:"flex", gap:8 }}>
-              <button onClick={confirmLeave} style={{ flex:1, padding:"10px", background:T.rd, border:`1px solid ${T.red}`, color:T.red, fontSize:9, letterSpacing:"0.2em", cursor:"pointer", borderRadius:2, textTransform:"uppercase" }}>
-                delete all + leave
-              </button>
-              <button onClick={() => setLeaveConfirm(false)} style={{ flex:1, padding:"10px", background:"transparent", border:`1px solid ${T.b1}`, color:T.sub, fontSize:9, letterSpacing:"0.2em", cursor:"pointer", borderRadius:2, textTransform:"uppercase" }}>
-                cancel
-              </button>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={confirmLeave} style={{flex:1,padding:"10px",background:T.rd,border:`1px solid ${T.red}`,color:T.red,fontSize:9,letterSpacing:"0.2em",cursor:"pointer",borderRadius:2,textTransform:"uppercase"}}>delete all + leave</button>
+              <button onClick={()=>setLeaveConfirm(false)} style={{flex:1,padding:"10px",background:"transparent",border:`1px solid ${T.b1}`,color:T.sub,fontSize:9,letterSpacing:"0.2em",cursor:"pointer",borderRadius:2,textTransform:"uppercase"}}>cancel</button>
             </div>
           </div>
         </div>
@@ -1255,142 +1118,154 @@ function ChatView({ roomId, mode, passphrase, onLeave }) {
 // ══════════════════════════════════════════════════════════════════════════════
 // COMPONENT: Setup
 // ──────────────────────────────────────────────────────────────────────────────
-// Handles both "create room" and "join room" flows from a single screen.
-// The flow is determined by whether ?room= is present in the URL.
+// Create or join a room. Join flow detected by ?r= in URL.
+// On join screen: fetches existing room expiry to show countdown.
+// Username field pre-filled from localStorage.
 //
-// Create flow: user picks passphrase + mode → generates a new room ID → sets URL
-// Join flow:   room ID + mode read from URL → user enters passphrase → joins
-//
-// The passphrase is validated client-side only (minimum 4 chars). No strength
-// check beyond that — the passphrase security is the user's responsibility.
-//
-// @prop onJoin  fn({ roomId, mode, passphrase }) — called to enter ChatView
+// @prop onJoin  fn({ roomId, mode, passphrase, expiresAt })
 // ══════════════════════════════════════════════════════════════════════════════
 
 function Setup({ onJoin }) {
-  const urlParams  = getUrlParams();
-  const isJoining  = !!urlParams.room; // true if arriving via a shared room URL
+  const urlParams=getUrlParams();
+  const isJoining=!!urlParams.room;
 
-  const [pass,   setPass]  = useState("");
-  const [mode,   setMode]  = useState(urlParams.mode || "svg"); // pre-filled from URL on join
-  const [ttl,    setTtl]   = useState("4");   // hours — cosmetic only, no server-side TTL
-  const [err,    setErr]   = useState("");
-  const [show,   setShow]  = useState(false); // passphrase visibility toggle
-  // On join: use the room from URL. On create: generate a fresh random room ID.
-  const [roomId] = useState(isJoining ? urlParams.room : makeRoomId());
+  const [pass,       setPass]      = useState("");
+  const [mode,       setMode]      = useState(urlParams.mode||"svg");
+  const [err,        setErr]       = useState("");
+  const [show,       setShow]      = useState(false);
+  const [loading,    setLoading]   = useState(false);
+  const [roomExpiry, setRoomExpiry]= useState(null); // prefetched for join screen
+  const [uname,      setUname]     = useState(getUsername());
+  const [roomId]                   = useState(isJoining?urlParams.room:makeRoomId());
 
-  const join = () => {
-    if (!pass.trim())          { setErr("passphrase required");    return; }
-    if (pass.trim().length < 4){ setErr("at least 4 characters");  return; }
-    setUrlParams(roomId, mode); // update URL before entering chat so share works immediately
-    onJoin({ roomId, mode, passphrase: pass.trim() });
+  // Prefetch room expiry for the join screen countdown
+  useEffect(()=>{
+    if(!isJoining)return;
+    sb.from("rooms").select("expires_at").eq("id",roomId).single()
+      .then(({data})=>{ if(data) setRoomExpiry(new Date(data.expires_at).getTime()); });
+  },[]);
+
+  const join=async()=>{
+    if(!pass.trim())            {setErr("passphrase required");   return;}
+    if(pass.trim().length<4)    {setErr("at least 4 characters"); return;}
+    if(!validateRoomId(roomId)) {setErr("invalid room id");       return;}
+    saveUsername(uname);
+    setLoading(true); setErr("");
+    try{
+      const {expiresAt}=await dbEnsureRoom(roomId);
+      setUrlParams(roomId,mode);
+      onJoin({roomId,mode,passphrase:pass.trim(),expiresAt});
+    }catch(e){
+      setErr("could not open room: "+e.message);
+      setLoading(false);
+    }
   };
 
-  return (
-    <div style={{ height:"100%", display:"flex", alignItems:"center", justifyContent:"center", background:T.bg, padding:20, overflowY:"auto" }}>
-      <div style={{ width:"100%", maxWidth:380 }}>
+  return(
+    <div style={{height:"100%",display:"flex",alignItems:"center",justifyContent:"center",background:T.bg,padding:20,overflowY:"auto"}}>
+      <div style={{width:"100%",maxWidth:380}}>
 
-        {/* Wordmark */}
-        <div style={{ textAlign:"center", marginBottom:32 }}>
-          <div style={{ fontFamily:DISP, fontSize:30, fontWeight:800, color:T.white, letterSpacing:"0.06em" }}>
-            Stego<span style={{ color:T.green }}>frame</span>
+        <div style={{textAlign:"center",marginBottom:32}}>
+          <div style={{fontFamily:DISP,fontSize:30,fontWeight:800,color:T.white,letterSpacing:"0.06em"}}>
+            Stego<span style={{color:T.green}}>frame</span>
           </div>
-          <div style={{ fontSize:8, color:T.muted, letterSpacing:"0.35em", marginTop:6 }}>STEGANOGRAPHIC TRANSPORT</div>
+          <div style={{fontSize:8,color:T.muted,letterSpacing:"0.35em",marginTop:6}}>STEGANOGRAPHIC TRANSPORT</div>
         </div>
 
-        <div style={{ background:T.surf, border:`1px solid ${T.b0}`, borderRadius:4, overflow:"hidden" }}>
-          {/* Panel header */}
-          <div style={{ padding:"11px 16px", borderBottom:`1px solid ${T.b0}`, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-            <div style={{ fontSize:9, letterSpacing:"0.3em", color:T.sub, textTransform:"uppercase" }}>
-              {isJoining ? "join room" : "create room"}
+        <div style={{background:T.surf,border:`1px solid ${T.b0}`,borderRadius:4,overflow:"hidden"}}>
+          <div style={{padding:"11px 16px",borderBottom:`1px solid ${T.b0}`,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <div style={{fontSize:9,letterSpacing:"0.3em",color:T.sub,textTransform:"uppercase"}}>
+              {isJoining?"join room":"create room"}
             </div>
-            <div style={{ fontSize:8, color:T.dim, letterSpacing:"0.15em", fontFamily:MONO }}>#{roomId}</div>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              {/* Show countdown on join screen if we already know the expiry */}
+              {isJoining&&roomExpiry&&<CountdownBadge expiresAt={roomExpiry}/>}
+              <div style={{fontSize:8,color:T.dim,letterSpacing:"0.15em",fontFamily:MONO}}>#{roomId}</div>
+            </div>
           </div>
 
-          <div style={{ padding:20, display:"flex", flexDirection:"column", gap:16 }}>
+          <div style={{padding:20,display:"flex",flexDirection:"column",gap:16}}>
 
-            {/* Join-mode banner — only shown when arriving via a shared URL */}
-            {isJoining && (
-              <div style={{ background:T.gd, border:`1px solid ${T.green}`, borderRadius:2, padding:"8px 12px", fontSize:9, color:T.green, lineHeight:1.7, letterSpacing:"0.05em" }}>
+            {isJoining&&(
+              <div style={{background:T.gd,border:`1px solid ${T.green}`,borderRadius:2,padding:"8px 12px",fontSize:9,color:T.green,lineHeight:1.7,letterSpacing:"0.05em"}}>
                 You've been invited to room <strong>#{roomId}</strong> in {mode.toUpperCase()} mode.
                 Enter the shared passphrase to join.
               </div>
             )}
 
-            {/* Passphrase field */}
+            {/* Display name */}
             <div>
-              <div style={{ fontSize:8, color:T.muted, letterSpacing:"0.25em", textTransform:"uppercase", marginBottom:6 }}>passphrase</div>
-              <div style={{ position:"relative" }}>
-                <input
-                  type={show ? "text" : "password"}
-                  value={pass}
-                  onChange={e => { setPass(e.target.value); setErr(""); }}
-                  onKeyDown={e => { if (e.key === "Enter") join(); }}
-                  placeholder={isJoining ? "enter shared passphrase…" : "choose a shared secret…"}
-                  autoFocus
-                  style={{ width:"100%", background:T.raised, border:`1px solid ${err ? T.red : T.b1}`, color:T.bright, padding:"9px 44px 9px 12px", fontSize:13, outline:"none", borderRadius:3 }}
-                />
-                <button
-                  onClick={() => setShow(v => !v)}
-                  style={{ position:"absolute", right:10, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", color:T.dim, cursor:"pointer", fontSize:9, letterSpacing:"0.1em" }}
-                >{show ? "hide" : "show"}</button>
+              <div style={{fontSize:8,color:T.muted,letterSpacing:"0.25em",textTransform:"uppercase",marginBottom:6}}>display name</div>
+              <input value={uname} onChange={e=>setUname(e.target.value.slice(0,24))} maxLength={24}
+                placeholder="your handle (optional)"
+                style={{width:"100%",background:T.raised,border:`1px solid ${T.b1}`,color:T.bright,padding:"9px 12px",fontSize:13,outline:"none",borderRadius:3}}
+              />
+              <div style={{fontSize:8,color:T.dim,marginTop:4,lineHeight:1.5}}>
+                Shown beside your messages. Saved locally. Max 24 chars.
               </div>
-              {err && <div style={{ fontSize:9, color:T.red, marginTop:5 }}>{err}</div>}
             </div>
 
-            {/* Encoding mode selector — only shown when creating (joiner's mode is set by URL) */}
-            {!isJoining && (
+            {/* Passphrase */}
+            <div>
+              <div style={{fontSize:8,color:T.muted,letterSpacing:"0.25em",textTransform:"uppercase",marginBottom:6}}>passphrase</div>
+              <div style={{position:"relative"}}>
+                <input type={show?"text":"password"} value={pass}
+                  onChange={e=>{setPass(e.target.value);setErr("");}}
+                  onKeyDown={e=>{if(e.key==="Enter")join();}}
+                  placeholder={isJoining?"enter shared passphrase…":"choose a shared secret…"} autoFocus
+                  style={{width:"100%",background:T.raised,border:`1px solid ${err?T.red:T.b1}`,color:T.bright,padding:"9px 44px 9px 12px",fontSize:13,outline:"none",borderRadius:3}}
+                />
+                <button onClick={()=>setShow(v=>!v)} style={{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:T.dim,cursor:"pointer",fontSize:9,letterSpacing:"0.1em"}}>
+                  {show?"hide":"show"}
+                </button>
+              </div>
+              {err&&<div style={{fontSize:9,color:T.red,marginTop:5}}>{err}</div>}
+            </div>
+
+            {/* Encoding mode — create only (joiner's mode comes from URL) */}
+            {!isJoining&&(
               <div>
-                <div style={{ fontSize:8, color:T.muted, letterSpacing:"0.25em", textTransform:"uppercase", marginBottom:6 }}>encoding mode</div>
-                <div style={{ display:"flex", gap:6 }}>
-                  {[Enc.SVG, Enc.LSB].map(m => (
-                    <button key={m} onClick={() => setMode(m)} style={{
-                      flex:1, padding:"9px 0",
-                      background:    mode === m ? T.gd          : "transparent",
-                      border:        `1px solid ${mode === m ? T.green : T.b1}`,
-                      color:         mode === m ? T.green        : T.muted,
-                      fontSize:9, letterSpacing:"0.2em", cursor:"pointer", borderRadius:3, textTransform:"uppercase",
+                <div style={{fontSize:8,color:T.muted,letterSpacing:"0.25em",textTransform:"uppercase",marginBottom:6}}>encoding mode</div>
+                <div style={{display:"flex",gap:6}}>
+                  {[Enc.SVG,Enc.LSB].map(m=>(
+                    <button key={m} onClick={()=>setMode(m)} style={{
+                      flex:1,padding:"9px 0",
+                      background:mode===m?T.gd:"transparent",
+                      border:`1px solid ${mode===m?T.green:T.b1}`,
+                      color:mode===m?T.green:T.muted,
+                      fontSize:9,letterSpacing:"0.2em",cursor:"pointer",borderRadius:3,textTransform:"uppercase",
                     }}>
                       <div>{m}</div>
-                      <div style={{ fontSize:7, color: mode === m ? T.green : T.dim, marginTop:3 }}>
-                        {m === Enc.SVG ? "vector · xml" : "raster · lsb"}
+                      <div style={{fontSize:7,color:mode===m?T.green:T.dim,marginTop:3}}>
+                        {m===Enc.SVG?"vector · xml":"raster · lsb"}
                       </div>
                     </button>
                   ))}
                 </div>
-                <div style={{ fontSize:8, color:T.dim, marginTop:6, lineHeight:1.7 }}>
-                  {mode === Enc.SVG ? "Carriers look like abstract art." : "Carriers look like pixel noise."}
-                  {" "}Both parties must use the same mode. The mode is shared via the URL.
+                <div style={{fontSize:8,color:T.dim,marginTop:6,lineHeight:1.7}}>
+                  {mode===Enc.SVG?"Carriers look like abstract art.":"Carriers look like pixel noise."}
+                  {" "}Both parties must use the same mode. Mode is shared via URL.
                 </div>
               </div>
             )}
 
-            {/* TTL field — cosmetic only, stored nowhere, reminds user sessions are ephemeral */}
-            {!isJoining && (
-              <div>
-                <div style={{ fontSize:8, color:T.muted, letterSpacing:"0.25em", textTransform:"uppercase", marginBottom:6 }}>session TTL (hours)</div>
-                <input
-                  value={ttl}
-                  onChange={e => setTtl(e.target.value)}
-                  placeholder="4"
-                  style={{ width:"100%", background:T.raised, border:`1px solid ${T.b1}`, color:T.bright, padding:"9px 12px", fontSize:13, outline:"none", borderRadius:3 }}
-                />
-                <div style={{ fontSize:8, color:T.dim, marginTop:5, lineHeight:1.6 }}>
-                  Messages persist in Supabase. TTL controls local session expiry only.
-                </div>
+            {/* TTL note — create only */}
+            {!isJoining&&(
+              <div style={{fontSize:8,color:T.dim,lineHeight:1.7,background:T.raised,border:`1px solid ${T.b0}`,borderRadius:2,padding:"8px 10px"}}>
+                ⏱ Rooms expire after <strong style={{color:T.txt}}>7 days</strong> and are permanently deleted.
+                A live countdown is shown in the room header.
               </div>
             )}
 
-            <button onClick={join} style={{
-              width:"100%", padding:"11px",
-              background: T.gd, border:`1px solid ${T.green}`, color:T.green,
-              fontSize:10, letterSpacing:"0.25em", cursor:"pointer", borderRadius:3, textTransform:"uppercase",
+            <button onClick={join} disabled={loading} style={{
+              width:"100%",padding:"11px",
+              background:loading?T.surf:T.gd,border:`1px solid ${loading?T.b1:T.green}`,color:loading?T.dim:T.green,
+              fontSize:10,letterSpacing:"0.25em",cursor:loading?"not-allowed":"pointer",borderRadius:3,textTransform:"uppercase",
             }}>
-              {isJoining ? "join room →" : "create + open room →"}
+              {loading?"opening room…":(isJoining?"join room →":"create + open room →")}
             </button>
 
-            {/* Security note */}
-            <div style={{ fontSize:8, color:T.dim, lineHeight:1.9, letterSpacing:"0.04em", borderTop:`1px solid ${T.b0}`, paddingTop:12 }}>
+            <div style={{fontSize:8,color:T.dim,lineHeight:1.9,letterSpacing:"0.04em",borderTop:`1px solid ${T.b0}`,paddingTop:12}}>
               The passphrase never leaves your device. Supabase only stores encrypted carrier images —
               without the passphrase they are indistinguishable from noise.
             </div>
@@ -1405,25 +1280,20 @@ function Setup({ onJoin }) {
 // ══════════════════════════════════════════════════════════════════════════════
 // COMPONENT: App (root)
 // ──────────────────────────────────────────────────────────────────────────────
-// Manages top-level session state. Two states: no session (Setup) or active
-// session (ChatView). Session holds { roomId, mode, passphrase } — the minimum
-// needed to participate in a room. Passphrase lives here in memory only.
-//
-// On leave: URL params are cleared so a refresh returns to the setup screen
-// rather than auto-joining the (now wiped) room.
+// Two states: null = Setup screen, object = active ChatView.
+// Session holds { roomId, mode, passphrase, expiresAt }.
+// Passphrase lives in memory only — never persisted anywhere.
 // ══════════════════════════════════════════════════════════════════════════════
 
-function App() {
-  const [session, setSession] = useState(null); // null = show Setup
-
+function App(){
+  const [session,setSession]=useState(null);
   const join  = s  => setSession(s);
   const leave = () => { clearUrlParams(); setSession(null); };
-
-  if (!session) return <Setup onJoin={join} />;
-  return <ChatView {...session} onLeave={leave} />;
+  if(!session) return <Setup onJoin={join}/>;
+  return <ChatView {...session} onLeave={leave}/>;
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
 </script>
 </body>
 </html>
