@@ -20,7 +20,13 @@ export async function onRequest(context) {
   newHeaders.set("apikey", env.SUPA_ANON);
   newHeaders.set("Authorization", `Bearer ${env.SUPA_ANON}`);
   
-  // Remove headers that might interfere with the proxy handshake
+  // BYPASS BROWSER DETECTION: 
+  // Supabase blocks secret keys if it sees browser-specific headers.
+  newHeaders.delete("origin");
+  newHeaders.delete("referer");
+  newHeaders.set("User-Agent", "Stegoframe-Proxy/1.0");
+  
+  // Remove host to let Cloudflare set it correctly
   newHeaders.delete("host");
 
   // 4. Construct the Forwarding Request
