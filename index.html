@@ -82,21 +82,22 @@ const sb = supabase.createClient(SUPA_URL, SUPA_ANON);
 // Store key and url as Cloudflare secrets (env variables) called SUPA_URL and SUPA_ANON
 // Then /functions/api/[[path]].js picks this up and does the rewrite.
 
-// Ensure no trailing slash on the origin
-const PROXY_URL = window.location.origin.replace(/\/$/, '') + '/api';
+let supabaseClient;
+try {
+    const PROXY_HOST = window.location.host;
+    const PROXY_URL  = `https://${PROXY_HOST}/api`;
 
-const supabaseClient = supabase.createClient(PROXY_URL, 'proxy-mode', {
-    auth: { persistSession: false }, // Useful for debugging
-    realtime: {
-        params: {
-            baseUrl: `${window.location.origin.replace('http', 'ws')}/api/realtime/v1`
+    supabaseClient = supabase.createClient(PROXY_URL, 'proxy-mode', {
+        realtime: {
+            params: {
+                baseUrl: `wss://${PROXY_HOST}/api/realtime/v1`
+            }
         }
-    }
-});
-
-// Add a simple error catcher to see if the client even starts
-supabaseClient.from('messages').select('count', { count: 'exact', head: true })
-  .then(({ error }) => { if (error) console.error("Proxy Connection Failed:", error); });
+    });
+} catch (e) {
+    console.error("Supabase Init Error:", e);
+    // You could set an error state here to show a message instead of black
+}
 
 
 
