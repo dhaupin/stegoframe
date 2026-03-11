@@ -84,11 +84,14 @@ const PROXY_URL  = `https://${PROXY_HOST}/api`;
 
 // We use 'proxy-mode' as a placeholder; 
 // Cloudflare replaces it with your real Secret Key on the fly.
-const supabaseClient = supabase.createClient(PROXY_URL, 'proxy-mode', {
+// /functions/api/[[path]].js picks this up and does the rewrite
+const PROXY_URL = window.location.origin + '/api';
+
+const supabaseClient = supabase.createClient(PROXY_URL, 'proxy-key', {
     realtime: {
         params: {
-            // This ensures WebSockets route through your Cloudflare Function
-            baseUrl: `wss://${PROXY_HOST}/api/realtime/v1`
+            // Correctly routes the WebSocket through the proxy
+            baseUrl: `${window.location.origin.replace('http', 'ws')}/api/realtime/v1`
         }
     }
 });
