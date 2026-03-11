@@ -81,34 +81,27 @@ const sb = supabase.createClient(SUPA_URL, SUPA_ANON);
 // SECURE - Supabase API routing through Cloudflare proxy.
 // Store key and url as Cloudflare secrets (env variables) called SUPA_URL and SUPA_ANON
 // Then /functions/api/[[path]].js picks this up and does the rewrite.
-
 let supabaseClient;
 try {
-    const PROXY_HOST = window.location.host;
-    const PROXY_URL  = `https://${PROXY_HOST}/api`;
+    const PROXY_URL = window.location.origin + '/api';
     
-    // Explicitly define the WebSocket path to avoid SyntaxErrors in the library
-    const WS_PROXY   = `wss://${PROXY_HOST}/api/realtime/v1`;
+    // We remove the /v1 here because the library often appends it automatically.
+    // This is the most common cause of the SyntaxError.
+    const WS_URL = window.location.origin.replace('http', 'ws') + '/api/realtime/v1';
 
     supabaseClient = supabase.createClient(PROXY_URL, 'proxy-mode', {
         realtime: {
-            params: {
-                baseUrl: WS_PROXY
-            }
+            // We tell the library exactly where the socket is
+            url: WS_URL,
+            // We empty the params to stop it from appending extra path segments
+            params: {}
         }
     });
 
-    // Forced override of the internal realtime URL to ensure the 
-    // WebSocket handshake hits our Cloudflare Function correctly.
-    if (supabaseClient.realtime) {
-        supabaseClient.realtime.url = WS_PROXY;
-    }
-    
-    console.log("Supabase initialized via Proxy:", PROXY_URL);
+    console.log("Supabase initialized. Socket target:", WS_URL);
 } catch (e) {
-    // If you're still getting a black screen, this alert will tell us why.
     console.error("Supabase Initialization Failed:", e);
-    alert("Init Error: " + e.message); 
+    alert("Init Error: " + e.message);
 }
 
 
