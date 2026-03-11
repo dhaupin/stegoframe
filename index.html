@@ -62,44 +62,25 @@ const { useState, useEffect, useRef, useCallback } = React;
 // ══════════════════════════════════════════════════════════════════════════════
 // SUPABASE CLIENT
 // ──────────────────────────────────────────────────────────────────────────────
-// The anon key is intentionally public — it grants access only within the
-// bounds of the RLS policies defined on the messages table. The key alone
-// cannot read, write, or delete without a matching policy.
+// SUPA_URL and SUPA_ANON are injected at request time by _worker.js, which
+// substitutes the {{SUPA_URL}} and {{SUPA_ANON}} placeholders with values from
+// Cloudflare Pages environment variables before serving this file.
 //
-// @why  We use the anon key (not service role) so that even if this file is
-//       inspected, an attacker cannot bypass RLS. The passphrase is the real
-//       secret — it never touches Supabase.
+// @why  The anon key is intentionally public by Supabase's design — it only
+//       grants what RLS policies allow. We keep it out of source control via
+//       env vars, but it is NOT a secret in the cryptographic sense. The real
+//       secret is the passphrase, which never leaves the client at all.
+//
+// @why  Direct connection (no proxy) — Supabase Realtime uses WebSockets that
+//       connect from the browser directly to Supabase's servers. Proxying
+//       WebSockets through Cloudflare Pages Functions is not supported (Pages
+//       Functions cannot upgrade connections). Attempting it breaks Realtime
+//       entirely. The direct connection is correct and intended.
 // ══════════════════════════════════════════════════════════════════════════════
 
-/*
-// INSECURE - Legacy Supabase JWT anon key support:
-const SUPA_URL  = "https://PROJECT.supabase.co";
-const SUPA_ANON "PROJECT-ANON-KEY";
+const SUPA_URL  = "{{SUPA_URL}}";
+const SUPA_ANON = "{{SUPA_ANON}}";
 const sb = supabase.createClient(SUPA_URL, SUPA_ANON);
-*/
-
-// SECURE - Supabase API routing through Cloudflare proxy.
-// Store key and url as Cloudflare secrets (env variables) called SUPA_URL and SUPA_ANON
-// Then /functions/api/[[path]].js picks this up and does the rewrite.
-let supabaseClient;
-try {
-    const PROXY_URL = window.location.origin + '/api';
-    
-    // We create the client with a placeholder first
-    supabaseClient = supabase.createClient(PROXY_URL, 'proxy-mode');
-
-    // Nuke the internal realtime URL and replace it with a clean string.
-    // This bypasses the library's internal URL parser that is causing the SyntaxError.
-    if (supabaseClient.realtime) {
-        const wsHost = window.location.host;
-        supabaseClient.realtime.url = `wss://${wsHost}/api/realtime/v1/websocket`;
-    }
-
-    console.log("Client initialized. Realtime forced to:", supabaseClient.realtime.url);
-} catch (e) {
-    console.error("Supabase Init Crash:", e);
-    alert("Check Console: " + e.message);
-}
 
 
 // ══════════════════════════════════════════════════════════════════════════════
