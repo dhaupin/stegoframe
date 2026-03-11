@@ -71,9 +71,28 @@ const { useState, useEffect, useRef, useCallback } = React;
 //       secret — it never touches Supabase.
 // ══════════════════════════════════════════════════════════════════════════════
 
-const SUPA_URL  = "https://nqmexdrahboulluqfirb.supabase.co";
-const SUPA_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5xbWV4ZHJhaGJvdWxsdXFmaXJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxNzg0NjAsImV4cCI6MjA4ODc1NDQ2MH0.nT4imMarrT-M0zp_EEDAzNOcYmZJuVQGG05g0FnMCls";
+/*
+// INSECURE - Legacy Supabase JWT anon key support:
+const SUPA_URL  = "https://PROJECT.supabase.co";
+const SUPA_ANON "PROJECT-ANON-KEY";
 const sb = supabase.createClient(SUPA_URL, SUPA_ANON);
+*/
+
+// SECURE - Supabase API routing through Cloudflare proxy. Store key and url as Cloudflare secrets (variables) called SUPA_URL and SUPA_ANON
+const PROXY_HOST = window.location.host;
+const PROXY_URL  = `https://${PROXY_HOST}/api`;
+
+// We use 'proxy-mode' as a placeholder; 
+// Cloudflare replaces it with your real Secret Key on the fly.
+const supabaseClient = supabase.createClient(PROXY_URL, 'proxy-mode', {
+    realtime: {
+        params: {
+            // This ensures WebSockets route through your Cloudflare Function
+            baseUrl: `wss://${PROXY_HOST}/api/realtime/v1`
+        }
+    }
+});
+
 
 
 // ══════════════════════════════════════════════════════════════════════════════
