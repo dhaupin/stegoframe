@@ -17,10 +17,11 @@ export async function onRequest(context) {
   const path = url.pathname.replace('/api', '');
 
   // IMPROVED WEBSOCKET PROXY
+  // Handle WebSocket Upgrades (Realtime)
   if (request.headers.get("Upgrade") === "websocket") {
-    // This ensures that whether the browser hits /api/realtime/v1 
-    // or /api/realtime/v1/websocket, it maps correctly to Supabase.
-    const wsTarget = `${supabaseBase.replace('http', 'ws')}${path}${url.search}`;
+    // This maps /api/realtime/v1/websocket -> /realtime/v1/websocket on Supabase
+    const supaWS = env.SUPA_URL.replace('http', 'ws').replace(/\/$/, '');
+    const wsTarget = `${supaWS}${path}${url.search}`;
     
     return fetch(wsTarget, {
       headers: request.headers,

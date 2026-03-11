@@ -85,23 +85,20 @@ let supabaseClient;
 try {
     const PROXY_URL = window.location.origin + '/api';
     
-    // We remove the /v1 here because the library often appends it automatically.
-    // This is the most common cause of the SyntaxError.
-    const WS_URL = window.location.origin.replace('http', 'ws') + '/api/realtime/v1';
+    // We create the client with a placeholder first
+    supabaseClient = supabase.createClient(PROXY_URL, 'proxy-mode');
 
-    supabaseClient = supabase.createClient(PROXY_URL, 'proxy-mode', {
-        realtime: {
-            // We tell the library exactly where the socket is
-            url: WS_URL,
-            // We empty the params to stop it from appending extra path segments
-            params: {}
-        }
-    });
+    // Nuke the internal realtime URL and replace it with a clean string.
+    // This bypasses the library's internal URL parser that is causing the SyntaxError.
+    if (supabaseClient.realtime) {
+        const wsHost = window.location.host;
+        supabaseClient.realtime.url = `wss://${wsHost}/api/realtime/v1/websocket`;
+    }
 
-    console.log("Supabase initialized. Socket target:", WS_URL);
+    console.log("Client initialized. Realtime forced to:", supabaseClient.realtime.url);
 } catch (e) {
-    console.error("Supabase Initialization Failed:", e);
-    alert("Init Error: " + e.message);
+    console.error("Supabase Init Crash:", e);
+    alert("Check Console: " + e.message);
 }
 
 
