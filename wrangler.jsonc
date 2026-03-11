@@ -17,9 +17,10 @@
   //
   // To use locally with wrangler dev:
   //   1. wrangler kv namespace create stegoframe-rate-limit
-  //   2. Replace "sf_throttle" below with the returned id
+  //   2. Replace "YOUR_NAMESPACE_ID" below with the returned id
   //
   // For Cloudflare Pages (production), bind via the dashboard instead:
+  //   Storage → workers kv → create instance
   //   Pages → your project → Settings → Functions → KV namespace bindings
   //   Variable name: SF_RL
   //
@@ -27,7 +28,7 @@
   "kv_namespaces": [
     {
       "binding": "SF_RL",
-      "id": "sf_throttle"
+      "id": "YOUR_NAMESPACE_ID"
     }
   ]
 }
