@@ -86,20 +86,30 @@ let supabaseClient;
 try {
     const PROXY_HOST = window.location.host;
     const PROXY_URL  = `https://${PROXY_HOST}/api`;
+    
+    // Explicitly define the WebSocket path to avoid SyntaxErrors in the library
+    const WS_PROXY   = `wss://${PROXY_HOST}/api/realtime/v1`;
 
     supabaseClient = supabase.createClient(PROXY_URL, 'proxy-mode', {
         realtime: {
             params: {
-                baseUrl: `wss://${PROXY_HOST}/api/realtime/v1`
+                baseUrl: WS_PROXY
             }
         }
     });
+
+    // Forced override of the internal realtime URL to ensure the 
+    // WebSocket handshake hits our Cloudflare Function correctly.
+    if (supabaseClient.realtime) {
+        supabaseClient.realtime.url = WS_PROXY;
+    }
+    
+    console.log("Supabase initialized via Proxy:", PROXY_URL);
 } catch (e) {
-    console.error("Supabase Init Error:", e);
-    // You could set an error state here to show a message instead of black
+    // If you're still getting a black screen, this alert will tell us why.
+    console.error("Supabase Initialization Failed:", e);
+    alert("Init Error: " + e.message); 
 }
-
-
 
 
 // ══════════════════════════════════════════════════════════════════════════════
