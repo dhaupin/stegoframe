@@ -1,7 +1,8 @@
 export async function onRequest(context) {
   const { request, env } = context;
+  const url = new URL(request.url);
 
-  // HANDLE CORS PREFLIGHT
+  // 1. Handle CORS Preflight immediately
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -14,43 +15,41 @@ export async function onRequest(context) {
     });
   }
 
-  const url = new URL(request.url);
-  
-  // 1. Map the internal path (e.g., /api/rest/v1/messages -> /rest/v1/messages)
+  // 2. Prepare the base Supabase URL (no trailing slash)
+  const supabaseBase = env.SUPA_URL.replace(/\/$/, '');
   const path = url.pathname.replace('/api', '');
-  const supabaseUrl = new URL(`${env.SUPA_URL}${path}${url.search}`);
 
-  // 2. Handle WebSocket Upgrades (Realtime)
+  // 3. Handle WebSocket Upgrades (Realtime)
+  // Must happen before any request body is touched
   if (request.headers.get("Upgrade") === "websocket") {
-    supabaseUrl.protocol = supabaseUrl.protocol.replace('http', 'ws');
-    return fetch(supabaseUrl.toString(), {
+    const wsUrl = `${supabaseBase.replace('http', 'ws')}${path}${url.search}`;
+    return fetch(wsUrl, {
       headers: request.headers,
       webSocket: true,
     });
   }
 
-  // 3. Prepare the Headers for REST (Injecting Secrets)
+  // 4. Prepare REST Request
+  const targetUrl = `${supabaseBase}${path}${url.search}`;
   const newHeaders = new Headers(request.headers);
+  
+  // Inject Secrets from Cloudflare Env
   newHeaders.set("apikey", env.SUPA_ANON);
   newHeaders.set("Authorization", `Bearer ${env.SUPA_ANON}`);
   
-  // BYPASS BROWSER DETECTION: 
-  // Supabase blocks secret keys if it sees browser-specific headers.
+  // Bypass Browser Detection / Security blocks
   newHeaders.delete("origin");
   newHeaders.delete("referer");
-  newHeaders.set("User-Agent", "Stegoframe-Proxy/1.0");
-  
-  // Remove host to let Cloudflare set it correctly
   newHeaders.delete("host");
+  newHeaders.set("User-Agent", "Stegoframe-Proxy/1.0");
 
-  // 4. Construct the Forwarding Request
   const fetchOptions = {
     method: request.method,
     headers: newHeaders,
-    // Only include body if it's not a GET or HEAD request
+    // Only include body if not GET/HEAD
     body: (request.method !== 'GET' && request.method !== 'HEAD') ? request.body : null,
-    duplex: 'half' 
+    duplex: 'half'
   };
 
-  return fetch(supabaseUrl.toString(), fetchOptions);
+  return fetch(targetUrl, fetchOptions);
 }
