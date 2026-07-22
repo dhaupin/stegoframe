@@ -238,7 +238,7 @@ function recordSend()  { _lastSendTs = Date.now(); }
 //   _VR  Version "1.0"
 // ══════════════════════════════════════════════════════════════════════════════
 
-const _PI=100_000, _SB=16, _IB=16, _BRN="BRN:", _VR="1.0";
+const _PI=100_000, _SB=16, _IB=12, _BRN="BRN:", _VR="1.0";
 const Enc = Object.freeze({ SVG:"svg", LSB:"lsb" });
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -348,25 +348,22 @@ async function _ad(d, p) {
   try {
     // d is now a hex string directly (from _up)
     const hex = typeof d === 'string' ? d : _toHex(d);
-    console.log("[DEBUG _ad] Input hex:", hex.substring(0, 80));
-    console.log("[DEBUG _ad] Passphrase:", p, "len:", p ? p.length : 0);
+    // DEBUG: Show visible alert with truncated info
+    // alert("[DEBUG _ad] Input hex: " + hex.substring(0, 60) + "...\nPass: " + p);
     const parts = hex.split(":");
-    console.log("[DEBUG _ad] Parts:", parts.length, parts.map(p => p.substring(0, 16)));
     if (parts.length !== 4) {
-      console.log("[DEBUG _ad] Invalid format - expected 4 parts, got", parts.length);
-      emit("crypto:decrypt", { result: "invalid_format", ts: Date.now() });
+      // Show in UI by emitting event with debug info
+      emit("crypto:decrypt", { result: "invalid_format", parts: parts.length, ts: Date.now() });
       return null;
     }
     const s = _fromHex(parts[0]);
     const iv = _fromHex(parts[1]);
     const authTag = _fromHex(parts[2]);
     const encrypted = _fromHex(parts[3]);
-    console.log("[DEBUG _ad] Salt len:", s.byteLength, "IV len:", iv.byteLength, "AT len:", authTag.byteLength, "Enc len:", encrypted.byteLength);
     // Combine authTag + encrypted for GCM
     const ct = new Uint8Array(authTag.byteLength + encrypted.byteLength);
     ct.set(authTag, 0);
     ct.set(encrypted, authTag.byteLength);
-    console.log("[DEBUG _ad] Derived key...");
     // Derive key and decrypt
     const ek = await _dk(p, s);
     const pt = await crypto.subtle.decrypt({name:"AES-GCM",iv}, ek, ct);
