@@ -403,13 +403,13 @@ const Codec = {
 //                  The encrypted carrier is the sensitive payload.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Ensure room exists; create with 7-day TTL if not. Returns { expiresAt: ms epoch }.
+// Ensure room exists; create with 7-day TTL if not. Returns { expiresAt, isNew }.
 // @why  upsert would silently reset expires_at on every join — we want the
 //       original creation time to be authoritative, so we read-then-insert.
 async function dbEnsureRoom(roomId) {
   const { data: existing } = await sb
     .from("rooms").select("expires_at").eq("id", roomId).single();
-  if (existing) return { expiresAt: new Date(existing.expires_at).getTime() };
+  if (existing) return { expiresAt: new Date(existing.expires_at).getTime(), isNew: false };
 
   // New room — calculate TTL from now
   const expiresAt = new Date(Date.now() + ROOM_TTL_MS).toISOString();
@@ -417,7 +417,7 @@ async function dbEnsureRoom(roomId) {
     .from("rooms").insert({ id: roomId, expires_at: expiresAt })
     .select("expires_at").single();
   if (error) throw error;
-  return { expiresAt: new Date(data.expires_at).getTime() };
+  return { expiresAt: new Date(data.expires_at).getTime(), isNew: true };
 }
 
 // Post carrier. Returns DB-assigned row id (needed for delete patching).
@@ -735,9 +735,10 @@ function Bubble({ msg, isMine, onDelete }) {
 // @prop passphrase  string (never leaves client memory)
 // @prop expiresAt   number (ms epoch) — from Supabase rooms table
 // @prop onLeave     fn()
+// @prop isNew       boolean — true if this is a newly created room
 // ══════════════════════════════════════════════════════════════════════════════
 
-function ChatView({ roomId, mode, passphrase, expiresAt, onLeave }) {
+function ChatView({ roomId, mode, passphrase, expiresAt, onLeave, isNew }) {
   const [msgs,       setMsgs]      = useState([]);
   const [text,       setText]      = useState("");
   const [busy,       setBusy]      = useState(false);
@@ -750,6 +751,7 @@ function ChatView({ roomId, mode, passphrase, expiresAt, onLeave }) {
   const [showProfile,setShowProfile] = useState(false);
   const [throttleMsg,setThrottleMsg] = useState(null);
   const [msgCount,   setMsgCount]  = useState(0);
+  const [showWelcome, setShowWelcome] = useState(isNew); // Show welcome for new rooms
 
   const bottomRef    = useRef();
   const textareaRef  = useRef();
@@ -910,11 +912,16 @@ function ChatView({ roomId, mode, passphrase, expiresAt, onLeave }) {
       const dbId=await dbPost(roomId,carrier,mode,SESSION_ID,username);
       setMsgs(prev=>prev.map(m=>m.localId===optimistic.localId?{...m,dbId}:m));
     }catch(e){
+      const errId = `err_${Date.now()}`;
       setMsgs(prev=>[...prev,{
-        dbId:null,localId:`err_${Date.now()}`,dir:"out",status:"failed",
+        dbId:null,localId:errId,dir:"out",status:"failed",
         mode,carrier:null,value:null,displayName:null,
         err:"send failed: "+e.message,ts:Date.now(),senderId:SESSION_ID,
       }]);
+      // Auto-clear failed messages after 5 seconds
+      setTimeout(()=>{
+        setMsgs(prev=>prev.filter(m=>m.localId!==errId));
+      },5000);
     }finally{setBusy(false);}
   };
 
@@ -999,6 +1006,14 @@ function ChatView({ roomId, mode, passphrase, expiresAt, onLeave }) {
       {showProfile&&(
         <div className="profile-widget" style={{position:"absolute",top:0,left:0,right:0,zIndex:99}}>
           <ProfileWidget onClose={()=>setShowProfile(false)}/>
+        </div>
+      )}
+
+      {/* Welcome message for new rooms */}
+      {showWelcome&&(
+        <div style={{padding:"12px 16px",background:T.gd,borderBottom:`1px solid ${T.b1}`,fontSize:12,color:T.green,animation:"fadeUp 0.3s"}}>
+          <span style={{fontWeight:500}}>New room created.</span> Share the URL with others — they'll need the same passphrase to join.
+          <button onClick={()=>setShowWelcome(false)} style={{float:"right",background:"none",border:"none",color:T.sub,cursor:"pointer",fontSize:14}}>×</button>
         </div>
       )}
 
@@ -1157,9 +1172,9 @@ function Setup({ onJoin }) {
     saveUsername(uname);
     setLoading(true); setErr("");
     try{
-      const {expiresAt}=await dbEnsureRoom(roomId);
+      const {expiresAt, isNew}=await dbEnsureRoom(roomId);
       setUrlParams(roomId,mode);
-      onJoin({roomId,mode,passphrase:pass.trim(),expiresAt});
+      onJoin({roomId,mode,passphrase:pass.trim(),expiresAt,isNew});
     }catch(e){
       setErr("could not open room: "+e.message);
       setLoading(false);

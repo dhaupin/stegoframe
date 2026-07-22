@@ -12,6 +12,12 @@
     "nodejs_compat"
   ],
 
+  // ── Scheduled trigger — runs every 10 minutes to clean up expired rooms ──
+  // Keeps the worker scheduled even on free tier (included in 100K/day limit)
+  "triggers": {
+    "crons": ["*/10 * * * *"]
+  },
+
   // ── KV namespace for rate limiting ──────────────────────────────────────────
   // Optional. If not bound, the worker silently skips rate limiting.
   //
