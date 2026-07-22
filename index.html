@@ -343,10 +343,11 @@ async function _ae(txt, p) {
 }
 
 // Vant-compatible decryption
+// d is hex string (e.g., "salt:iv:authTag:encrypted")
 async function _ad(d, p) {
   try {
-    // d is Uint8Array, convert back to hex string
-    const hex = _toHex(d);
+    // d is now a hex string directly (from _up)
+    const hex = typeof d === 'string' ? d : _toHex(d);
     const parts = hex.split(":");
     if (parts.length !== 4) {
       emit("crypto:decrypt", { result: "invalid_format", ts: Date.now() });
@@ -391,19 +392,20 @@ function _pk(p) {
   return _BRN + "ENC:" + p;
 }
 
-// Parse Vant-style packet: "BRN:ENC:<hex>" -> Uint8Array
+// Parse Vant-style packet: "BRN:ENC:<hex>" -> hex string (as string)
 function _up(b, allowLegacy = false) {
   // b can be string or Uint8Array
   const s = typeof b === 'string' ? b : new TextDecoder().decode(b);
   
   // Check current format: BRN:ENC:<hex>
   if (s.startsWith(_BRN + "ENC:")) {
-    return _fromHex(s.slice(_BRN.length + 4)); // skip "BRN:ENC:"
+    return s.slice(_BRN.length + 4); // Return hex string directly
   }
   
-  // Legacy: BRN:1.0: format
+  // Legacy: BRN:1.0: format (base64)
   if (allowLegacy && s.startsWith(_BRN + _VR + ":")) {
-    return _bu(s.slice(_BRN.length + _VR.length + 1));
+    const decoded = _bu(s.slice(_BRN.length + _VR.length + 1));
+    return _toHex(decoded); // Convert to hex for compatibility
   }
   return null;
 }
