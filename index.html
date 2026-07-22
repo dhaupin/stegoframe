@@ -348,11 +348,16 @@ async function _ad(d, p) {
   try {
     // d is now a hex string directly (from _up)
     const hex = typeof d === 'string' ? d : _toHex(d);
+    console.log("[DEBUG _ad] Input hex:", hex.substring(0, 40), "...");
+    console.log("[DEBUG _ad] Passphrase:", p);
     const parts = hex.split(":");
+    console.log("[DEBUG _ad] Parts count:", parts.length);
     if (parts.length !== 4) {
+      console.log("[DEBUG _ad] Invalid format - expected 4 parts, got", parts.length);
       emit("crypto:decrypt", { result: "invalid_format", ts: Date.now() });
       return null;
     }
+    console.log("[DEBUG _ad] Salt:", parts[0].substring(0, 10), "... IV:", parts[1].substring(0, 10));
     const s = _fromHex(parts[0]);
     const iv = _fromHex(parts[1]);
     const authTag = _fromHex(parts[2]);
@@ -396,10 +401,13 @@ function _pk(p) {
 function _up(b, allowLegacy = false) {
   // b can be string or Uint8Array
   const s = typeof b === 'string' ? b : new TextDecoder().decode(b);
+  console.log("[DEBUG _up] Input:", s.substring(0, 50), "...");
   
   // Check current format: BRN:ENC:<hex>
   if (s.startsWith(_BRN + "ENC:")) {
-    return s.slice(_BRN.length + 4); // Return hex string directly
+    const result = s.slice(_BRN.length + 4);
+    console.log("[DEBUG _up] Extracted hex:", result.substring(0, 30), "...");
+    return result; // Return hex string directly
   }
   
   // Legacy: BRN:1.0: format (base64)
@@ -407,6 +415,7 @@ function _up(b, allowLegacy = false) {
     const decoded = _bu(s.slice(_BRN.length + _VR.length + 1));
     return _toHex(decoded); // Convert to hex for compatibility
   }
+  console.log("[DEBUG _up] No match, returning null");
   return null;
 }
 
