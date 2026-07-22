@@ -3,12 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
-  <title>Stegoframe | Encrypted Steganographic Chat for Humans and Machines</title>
-  <meta name="description" content="Stegoframe: An agnostic way to send/receive data using SVG and PNG carriers, moving encrypted payloads. This is an experimental human chat interface providing proof of concept." />
-  <meta name="keywords" content="steganography, encrypted, chat, open source, oss, react, supabase" />
-  <meta name="author" content="Creadev.org" />
-  <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1" />
-  <link rel="canonical" href="https://stegoframe.creadev.org" />
+  <title>Stegoframe</title>
 
   <!--
     Stegoframe — steganographic transport middleware
@@ -232,63 +227,14 @@ function recordSend()  { _lastSendTs = Date.now(); }
 //
 // Encryption constants:
 //   _PI  PBKDF2 iterations (100,000)
-//   _SB  Salt bytes (16) - matches Vant
-//   _IB  AES-GCM IV bytes (16) - matches Vant
-//   _BRN Magic "BRN:" text prefix (Vant-compatible)
-//   _VR  Version "1.0"
+//   _SB  Salt bytes (16)
+//   _IB  AES-GCM IV bytes (12)
+//   _MG  Magic 0x534746 ("SGF") — frame identifier
+//   _VR  Version byte 0x02
 // ══════════════════════════════════════════════════════════════════════════════
 
-const _PI=100_000, _SB=16, _IB=12, _BRN="BRN:", _VR="1.0";
+const _PI=100_000, _SB=16, _IB=12, _MG=0x534746, _VR=0x02;
 const Enc = Object.freeze({ SVG:"svg", LSB:"lsb" });
-
-// ══════════════════════════════════════════════════════════════════════════════
-// ERROR CODES (Vant-inspired)
-// ──────────────────────────────────────────────────────────────────────────────
-const Err = Object.freeze({
-  OK: null,
-  INVALID_KEY: "ERR_INVALID_KEY",
-  CORRUPT_DATA: "ERR_CORRUPT_DATA", 
-  INVALID_FORMAT: "ERR_INVALID_FORMAT",
-  WRONG_MODE: "ERR_WRONG_MODE",
-  RATE_LIMITED: "ERR_RATE_LIMITED",
-  PAYLOAD_TOO_LARGE: "ERR_PAYLOAD_TOO_LARGE",
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// EVENT SYSTEM (lightweight audit logging)
-// ──────────────────────────────────────────────────────────────────────────────
-const _evts = [];
-function emit(event, data) {
-  _evts.push({ event, data, ts: Date.now() });
-  if (_evts.length > 100) _evts.shift(); // Keep last 100
-}
-function getEvents() { return [..._evts]; }
-
-// ══════════════════════════════════════════════════════════════════════════════
-// PASSPHRASE TIMEOUT (auto-clear from memory after inactivity)
-// ──────────────────────────────────────────────────────────────────────────────
-const _passCtx = { key: null, lastUsed: 0, timeoutMs: 5 * 60 * 1000 }; // 5 min default
-function _setPassKey(key) { _passCtx.key = key; _passCtx.lastUsed = Date.now(); }
-function _getPassKey() { 
-  if (!_passCtx.key) return null;
-  if (Date.now() - _passCtx.lastUsed > _passCtx.timeoutMs) { _passCtx.key = null; return null; }
-  _passCtx.lastUsed = Date.now();
-  return _passCtx.key;
-}
-function _clearPass() { _passCtx.key = null; }
-
-// ══════════════════════════════════════════════════════════════════════════════
-// RATE LIMITING (prevent abuse)
-// ──────────────────────────────────────────────────────────────────────────────
-const _rl = { counts: {}, windowMs: 60000, max: 20 }; // 20 req/min
-function _checkRateLimit(id) {
-  const now = Date.now(), key = id + ":" + Math.floor(now / _rl.windowMs);
-  _rl.counts[key] = (_rl.counts[key] || 0) + 1;
-  if (_rl.counts[key] > _rl.max) return false;
-  // Cleanup old entries
-  for (const k in _rl.counts) { if (now - parseInt(k.split(":")[1]) * _rl.windowMs > _rl.windowMs * 2) delete _rl.counts[k]; }
-  return true;
-}
 
 // ── Key derivation ────────────────────────────────────────────────────────────
 
@@ -305,116 +251,42 @@ async function _dk(p, s) {
   );
 }
 
-// Constant-time compare (prevent timing attacks)
-async function _cteq(a, b) {
-  if (a.byteLength !== b.byteLength) return false;
-  const av = new Uint8Array(a), bv = new Uint8Array(b);
-  let result = 0;
-  for (let i = 0; i < av.length; i++) result |= av[i] ^ bv[i];
-  return result === 0;
-}
-
-// HMAC for encrypt-then-MAC (detect tampering before decrypt)
-async function _hmac(data, key) {
-  const cryptoKey = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), {name: "HMAC", hash: "SHA-256"}, false, ["sign"]);
-  const sig = await crypto.subtle.sign("HMAC", cryptoKey, data);
-  return new Uint8Array(sig);
-}
-
-// Vant-compatible encryption: AES-256-GCM with PBKDF2
-// Format: salt:iv:authTag:encrypted (all hex-encoded, like Vant)
-// This matches vant/lib/encrypt.js exactly
+// @returns  Uint8Array: [salt(16)] + [iv(12)] + [ciphertext + 16-byte auth tag]
 async function _ae(txt, p) {
-  const s = crypto.getRandomValues(new Uint8Array(_SB));
-  const iv = crypto.getRandomValues(new Uint8Array(_IB));
-  // Derive key using same params as Vant
-  const ek = await _dk(p, s);
-  // Encrypt payload
-  const ct = await crypto.subtle.encrypt({name:"AES-GCM",iv}, ek, new TextEncoder().encode(txt));
-  // Convert to hex format: salt:iv:authTag:encrypted
-  const ctArr = new Uint8Array(ct);
-  // Auth tag is last 16 bytes of GCM output
-  const authTag = ctArr.slice(ctArr.byteLength - 16);
-  const encrypted = ctArr.slice(0, ctArr.byteLength - 16);
-  // Format: salt:iv:authTag:encrypted (all hex)
-  const result = _toHex(s) + ":" + _toHex(iv) + ":" + _toHex(authTag) + ":" + _toHex(encrypted);
-  emit("crypto:encrypt", { mode: "aes-gcm", format: "vant", ts: Date.now() });
-  return result; // Return hex string directly
+  const s=crypto.getRandomValues(new Uint8Array(_SB));
+  const iv=crypto.getRandomValues(new Uint8Array(_IB));
+  const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv}, await _dk(p,s), new TextEncoder().encode(txt));
+  const o=new Uint8Array(_SB+_IB+ct.byteLength);
+  o.set(s); o.set(iv,_SB); o.set(new Uint8Array(ct),_SB+_IB);
+  return o;
 }
 
-// Vant-compatible decryption
-// d is hex string (e.g., "salt:iv:authTag:encrypted")
+// @returns  plaintext string, or null on wrong key / tampered data (silent failure)
+// @why  Silent null — AES-GCM auth tag failure reveals nothing about whether
+//       a payload exists. The carrier just appears empty.
 async function _ad(d, p) {
   try {
-    // d is now a hex string directly (from _up)
-    const hex = typeof d === 'string' ? d : _toHex(d);
-    // DEBUG: Show visible alert with truncated info
-    // alert("[DEBUG _ad] Input hex: " + hex.substring(0, 60) + "...\nPass: " + p);
-    const parts = hex.split(":");
-    if (parts.length !== 4) {
-      // Show in UI by emitting event with debug info
-      emit("crypto:decrypt", { result: "invalid_format", parts: parts.length, ts: Date.now() });
-      return null;
-    }
-    const s = _fromHex(parts[0]);
-    const iv = _fromHex(parts[1]);
-    const authTag = _fromHex(parts[2]);
-    const encrypted = _fromHex(parts[3]);
-    // Combine authTag + encrypted for GCM
-    const ct = new Uint8Array(authTag.byteLength + encrypted.byteLength);
-    ct.set(authTag, 0);
-    ct.set(encrypted, authTag.byteLength);
-    // Derive key and decrypt
-    const ek = await _dk(p, s);
-    const pt = await crypto.subtle.decrypt({name:"AES-GCM",iv}, ek, ct);
-    emit("crypto:decrypt", { result: "success", ts: Date.now() });
-    return new TextDecoder().decode(pt);
-  } catch (e) {
-    emit("crypto:decrypt", { result: "error", error: e.message, ts: Date.now() });
-    return null;
-  }
+    return new TextDecoder().decode(
+      await crypto.subtle.decrypt({name:"AES-GCM",iv:d.slice(_SB,_SB+_IB)}, await _dk(p,d.slice(0,_SB)), d.slice(_SB+_IB))
+    );
+  } catch { return null; }
 }
 
-// Hex helpers (Vant uses hex encoding)
-function _toHex(buf) {
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-function _fromHex(hex) {
-  const buf = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < buf.length; i++) buf[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return buf;
-}
-function _toBuf(hex) {
-  return _fromHex(hex);
-}
+// ── Binary frame (8-byte header wraps every payload before carrier embedding) ─
+// [0-2] Magic 0x53 0x47 0x46 | [3] Version | [4-7] uint32 length BE | [8+] payload
 
-// ── Vant-compatible packet format ──────────────────────────────────────────────
-// Format: "BRN:ENC:<hex_encrypted>" (matches vant lib/stego.js exactly)
 function _pk(p) {
-  // p is hex string from _ae
-  return _BRN + "ENC:" + p;
+  const b=new Uint8Array(8+p.length);
+  b[0]=(_MG>>16)&0xFF; b[1]=(_MG>>8)&0xFF; b[2]=_MG&0xFF; b[3]=_VR;
+  const l=p.length;
+  b[4]=(l>>24)&0xFF; b[5]=(l>>16)&0xFF; b[6]=(l>>8)&0xFF; b[7]=l&0xFF;
+  b.set(p,8); return b;
 }
-
-// Parse Vant-style packet: "BRN:ENC:<hex>" -> hex string (as string)
-function _up(b, allowLegacy = false) {
-  // b can be string or Uint8Array
-  const s = typeof b === 'string' ? b : new TextDecoder().decode(b);
-  console.log("[DEBUG _up] Input:", s.substring(0, 50), "...");
-  
-  // Check current format: BRN:ENC:<hex>
-  if (s.startsWith(_BRN + "ENC:")) {
-    const result = s.slice(_BRN.length + 4);
-    console.log("[DEBUG _up] Extracted hex:", result.substring(0, 30), "...");
-    return result; // Return hex string directly
-  }
-  
-  // Legacy: BRN:1.0: format (base64)
-  if (allowLegacy && s.startsWith(_BRN + _VR + ":")) {
-    const decoded = _bu(s.slice(_BRN.length + _VR.length + 1));
-    return _toHex(decoded); // Convert to hex for compatibility
-  }
-  console.log("[DEBUG _up] No match, returning null");
-  return null;
+function _up(b) {
+  if(b.length<8) return null;
+  if(((b[0]<<16)|(b[1]<<8)|b[2])!==_MG||b[3]!==_VR) return null;
+  const l=(b[4]<<24)|(b[5]<<16)|(b[6]<<8)|b[7];
+  return(l>0&&l<=b.length-8)?b.slice(8,8+l):null;
 }
 
 // ── Base64 / bit helpers ──────────────────────────────────────────────────────
@@ -428,35 +300,22 @@ function _b2B(bits){
   return b;
 }
 
-// ── LSB carrier (with detection resistance) ───────────────────────────────────
+// ── LSB carrier ───────────────────────────────────────────────────────────────
 
 // Writes payload into LSB of red channel pixels of a square noise PNG.
-// Detection resistance: extra noise in unused bits, random pixel distribution
 // Alpha forced to 255 — transparency would reveal the image is synthetic.
 function lsbWrite(payload) {
   const pk=_pk(payload);
   const dim=Math.max(32,Math.ceil(Math.sqrt(pk.length*8)));
   const cv=document.createElement("canvas"); cv.width=cv.height=dim;
   const cx=cv.getContext("2d"), im=cx.createImageData(dim,dim);
-  // Full random noise - makes it look like static
   crypto.getRandomValues(im.data);
-  // Force alpha to 255 (opaque)
   for(let i=3;i<im.data.length;i+=4) im.data[i]=255;
-  // Embed payload in LSB of red channel
   for(let i=0;i<pk.length*8;i++){
     const bit=(pk[Math.floor(i/8)]>>(7-(i%8)))&1;
     im.data[i*4]=(im.data[i*4]&0xFE)|bit;
   }
-  // Detection resistance: add small noise in green/blue channels (unused)
-  // This makes it harder to detect that only red channel is used
-  for(let i=0;i<Math.min(dim*dim, 50);i++){
-    const idx = i * 4;
-    im.data[idx+1] = (im.data[idx+1] & 0xF8) | (Math.random() * 8 | 0); // noise in green
-    im.data[idx+2] = (im.data[idx+2] & 0xF8) | (Math.random() * 8 | 0); // noise in blue
-  }
-  cx.putImageData(im,0,0);
-  emit("stego:encode", { mode: "lsb", payloadLen: payload.length, ts: Date.now() });
-  return cv.toDataURL("image/png");
+  cx.putImageData(im,0,0); return cv.toDataURL("image/png");
 }
 
 // @why  No crossOrigin on Image — data URLs are same-origin. crossOrigin="anonymous"
@@ -470,88 +329,58 @@ async function lsbRead(url) {
       const d=cx.getImageData(0,0,im.width,im.height).data;
       const hb=[]; for(let i=0;i<64;i++) hb.push(d[i*4]&1);
       const hdr=_b2B(hb);
-      // Try current version first, then legacy v0x02
-      let hdrOk = _up(hdr);
-      if (!hdrOk && hdr[3] === 0x02) hdrOk = _up(hdr, true);
-      if(!hdrOk){ emit("stego:decode", { mode: "lsb", result: "no_payload", ts: Date.now() }); res(null); return; }
+      if(!_up(hdr)){res(null);return;}
       const l=(hdr[4]<<24)|(hdr[5]<<16)|(hdr[6]<<8)|hdr[7],tb=(8+l)*8,ab=[];
       for(let i=0;i<tb;i++) ab.push(d[i*4]&1);
-      const result = _up(_b2B(ab), true); // Allow legacy
-      emit("stego:decode", { mode: "lsb", result: result ? "success" : "invalid", ts: Date.now() });
-      res(result);
+      res(_up(_b2B(ab)));
     };
-    im.onerror=()=>{ emit("stego:decode", { mode: "lsb", result: "error", ts: Date.now() }); res(null); }
-    im.src=url;
+    im.onerror=()=>res(null); im.src=url;
   });
 }
 
-// ── SVG carrier (with detection resistance) ─────────────────────────────────────
+// ── SVG carrier ───────────────────────────────────────────────────────────────
 
 // Embeds payload in <desc data-p="..."> of a decorative gradient SVG.
-// Detection resistance: random colors, positions, sizes, extra decorative elements
 // @why  btoa(unescape(encodeURIComponent(...))) — handles multi-byte UTF-8 safely.
 function svgWrite(payload) {
   const b64=_ub(_pk(payload));
   const h=Math.floor(Math.random()*360), h2=(h+137)%360;
-  // Variable number of decorative elements (4-8) for noise
-  const numEls = 4 + Math.floor(Math.random() * 5);
-  const els=Array.from({length:numEls},(_,i)=>{
-    const cx = (Math.random() * 88 + 6).toFixed(1);
-    const cy = (Math.random() * 88 + 6).toFixed(1);
-    const r = (Math.random() * 10 + 1).toFixed(1);
-    const fill = `hsla(${(h+i*53)%360},${30+Math.random()*30}%,${40+Math.random()*30}%,${0.05+Math.random()*0.15})`;
-    return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${fill}"/>`;
-  }).join("");
-  // Randomize gradient direction
-  const gx = (20 + Math.random() * 60).toFixed(0), gy = (20 + Math.random() * 60).toFixed(0);
-  // Vant-compatible: use brn:secret tag in stega namespace
-  const svg=`<svg xmlns="http://www.w3.org/2000/svg" xmlns:brn="http://steganography.dev/brn" width="100" height="100" viewBox="0 0 100 100">`
-    +`<defs><radialGradient id="g" cx="${gx}%" cy="${gy}%">`
-    +`<stop offset="0%" stop-color="hsl(${h},${40+Math.random()*20}%,${50+Math.random()*20}%)"/>`
-    +`<stop offset="100%" stop-color="hsl(${h2},${30+Math.random()*20}%,${15+Math.random()*10}%)"/>`
-    +`</radialGradient></defs><rect width="100" height="100" fill="url(#g)"/>${els}`
-    +`<brn:secret>${b64}</brn:secret></svg>`;
-  emit("stego:encode", { mode: "svg", payloadLen: payload.length, ts: Date.now() });
+  const els=Array.from({length:5},(_,i)=>
+    `<circle cx="${(8+Math.random()*84).toFixed(1)}" cy="${(8+Math.random()*84).toFixed(1)}" r="${(2+Math.random()*8).toFixed(1)}" fill="hsla(${(h+i*43)%360},45%,60%,0.1)"/>`
+  ).join("");
+  const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">`
+    +`<desc data-f="${_VR}" data-p="${b64}"/>`
+    +`<defs><radialGradient id="g" cx="42%" cy="42%" r="62%">`
+    +`<stop offset="0%" stop-color="hsl(${h},50%,62%)"/>`
+    +`<stop offset="100%" stop-color="hsl(${h2},42%,18%)"/>`
+    +`</radialGradient></defs><rect width="100" height="100" fill="url(#g)"/>${els}</svg>`;
   return "data:image/svg+xml;base64,"+btoa(unescape(encodeURIComponent(svg)));
 }
 
 function svgRead(url) {
   try {
     const raw=decodeURIComponent(escape(atob(url.split(",")[1])));
-    // Vant-compatible: parse brn:secret tag
-    const m=raw.match(/<brn:secret>([A-Za-z0-9+/=]+)<\/brn:secret>/);
-    if (!m) { emit("stego:decode", { mode: "svg", result: "no_payload", ts: Date.now() }); return null; }
-    // Try current version, then legacy
-    let result = _up(_bu(m[1]));
-    if (!result) result = _up(_bu(m[1]), true); // Try legacy
-    emit("stego:decode", { mode: "svg", result: result ? "success" : "invalid", ts: Date.now() });
-    return result;
-  } catch (e) { emit("stego:decode", { mode: "svg", result: "error", error: e.message, ts: Date.now() }); return null; }
+    const m=raw.match(/data-p="([A-Za-z0-9+/=]+)"/);
+    return m?_up(_bu(m[1])):null;
+  } catch { return null; }
 }
 
 // ── Codec public API ──────────────────────────────────────────────────────────
 
 const Codec = {
   async encode(txt,pass,mode) {
-    if (!_checkRateLimit("encode")) { emit("stego:error", { code: Err.RATE_LIMITED, ts: Date.now() }); throw new Error("Rate limited"); }
     const e=await _ae(txt,pass);
     return mode===Enc.LSB?lsbWrite(e):svgWrite(e);
   },
   async decode(url,pass) {
-    if (!_checkRateLimit("decode")) { emit("stego:error", { code: Err.RATE_LIMITED, ts: Date.now() }); throw new Error("Rate limited"); }
     let r=svgRead(url);
-    console.log("[DEBUG Codec.decode] svgRead result:", r ? r.substring(0, 40) + "..." : "null");
     if(!r) r=await lsbRead(url); // SVG failed — try LSB
     if(!r) return null;
-    return _ad(r, pass);
+    return _ad(r,pass);
   },
   sniff(url) {
     if(!url) return Enc.SVG;
-    try{
-      const raw = atob(url.split(",")[1]).slice(0,128);
-      if(raw.includes("<brn:secret>")) return Enc.SVG;
-      if(raw.includes("<svg")) return Enc.SVG;
-    }catch{}
+    try{const p=atob(url.split(",")[1]).slice(0,64);if(p.includes("<svg"))return Enc.SVG;}catch{}
     return Enc.LSB;
   },
 };
@@ -569,13 +398,13 @@ const Codec = {
 //                  The encrypted carrier is the sensitive payload.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Ensure room exists; create with 7-day TTL if not. Returns { expiresAt, isNew }.
+// Ensure room exists; create with 7-day TTL if not. Returns { expiresAt: ms epoch }.
 // @why  upsert would silently reset expires_at on every join — we want the
 //       original creation time to be authoritative, so we read-then-insert.
 async function dbEnsureRoom(roomId) {
   const { data: existing } = await sb
     .from("rooms").select("expires_at").eq("id", roomId).single();
-  if (existing) return { expiresAt: new Date(existing.expires_at).getTime(), isNew: false };
+  if (existing) return { expiresAt: new Date(existing.expires_at).getTime() };
 
   // New room — calculate TTL from now
   const expiresAt = new Date(Date.now() + ROOM_TTL_MS).toISOString();
@@ -583,7 +412,7 @@ async function dbEnsureRoom(roomId) {
     .from("rooms").insert({ id: roomId, expires_at: expiresAt })
     .select("expires_at").single();
   if (error) throw error;
-  return { expiresAt: new Date(data.expires_at).getTime(), isNew: true };
+  return { expiresAt: new Date(data.expires_at).getTime() };
 }
 
 // Post carrier. Returns DB-assigned row id (needed for delete patching).
@@ -901,10 +730,9 @@ function Bubble({ msg, isMine, onDelete }) {
 // @prop passphrase  string (never leaves client memory)
 // @prop expiresAt   number (ms epoch) — from Supabase rooms table
 // @prop onLeave     fn()
-// @prop isNew       boolean — true if this is a newly created room
 // ══════════════════════════════════════════════════════════════════════════════
 
-function ChatView({ roomId, mode, passphrase, expiresAt, onLeave, isNew }) {
+function ChatView({ roomId, mode, passphrase, expiresAt, onLeave }) {
   const [msgs,       setMsgs]      = useState([]);
   const [text,       setText]      = useState("");
   const [busy,       setBusy]      = useState(false);
@@ -917,7 +745,6 @@ function ChatView({ roomId, mode, passphrase, expiresAt, onLeave, isNew }) {
   const [showProfile,setShowProfile] = useState(false);
   const [throttleMsg,setThrottleMsg] = useState(null);
   const [msgCount,   setMsgCount]  = useState(0);
-  const [showWelcome, setShowWelcome] = useState(isNew); // Show welcome for new rooms
 
   const bottomRef    = useRef();
   const textareaRef  = useRef();
@@ -1078,16 +905,11 @@ function ChatView({ roomId, mode, passphrase, expiresAt, onLeave, isNew }) {
       const dbId=await dbPost(roomId,carrier,mode,SESSION_ID,username);
       setMsgs(prev=>prev.map(m=>m.localId===optimistic.localId?{...m,dbId}:m));
     }catch(e){
-      const errId = `err_${Date.now()}`;
       setMsgs(prev=>[...prev,{
-        dbId:null,localId:errId,dir:"out",status:"failed",
+        dbId:null,localId:`err_${Date.now()}`,dir:"out",status:"failed",
         mode,carrier:null,value:null,displayName:null,
         err:"send failed: "+e.message,ts:Date.now(),senderId:SESSION_ID,
       }]);
-      // Auto-clear failed messages after 5 seconds
-      setTimeout(()=>{
-        setMsgs(prev=>prev.filter(m=>m.localId!==errId));
-      },5000);
     }finally{setBusy(false);}
   };
 
@@ -1172,14 +994,6 @@ function ChatView({ roomId, mode, passphrase, expiresAt, onLeave, isNew }) {
       {showProfile&&(
         <div className="profile-widget" style={{position:"absolute",top:0,left:0,right:0,zIndex:99}}>
           <ProfileWidget onClose={()=>setShowProfile(false)}/>
-        </div>
-      )}
-
-      {/* Welcome message for new rooms */}
-      {showWelcome&&(
-        <div style={{padding:"12px 16px",background:T.gd,borderBottom:`1px solid ${T.b1}`,fontSize:12,color:T.green,animation:"fadeUp 0.3s"}}>
-          <span style={{fontWeight:500}}>New room created.</span> Share the URL with others — they'll need the same passphrase to join.
-          <button onClick={()=>setShowWelcome(false)} style={{float:"right",background:"none",border:"none",color:T.sub,cursor:"pointer",fontSize:14}}>×</button>
         </div>
       )}
 
@@ -1338,9 +1152,9 @@ function Setup({ onJoin }) {
     saveUsername(uname);
     setLoading(true); setErr("");
     try{
-      const {expiresAt, isNew}=await dbEnsureRoom(roomId);
+      const {expiresAt}=await dbEnsureRoom(roomId);
       setUrlParams(roomId,mode);
-      onJoin({roomId,mode,passphrase:pass.trim(),expiresAt,isNew});
+      onJoin({roomId,mode,passphrase:pass.trim(),expiresAt});
     }catch(e){
       setErr("could not open room: "+e.message);
       setLoading(false);
