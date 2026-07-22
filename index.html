@@ -542,6 +542,7 @@ const Codec = {
   async decode(url,pass) {
     if (!_checkRateLimit("decode")) { emit("stego:error", { code: Err.RATE_LIMITED, ts: Date.now() }); throw new Error("Rate limited"); }
     let r=svgRead(url);
+    console.log("[DEBUG Codec.decode] svgRead result:", r ? r.substring(0, 40) + "..." : "null");
     if(!r) r=await lsbRead(url); // SVG failed — try LSB
     if(!r) return null;
     return _ad(r, pass);
