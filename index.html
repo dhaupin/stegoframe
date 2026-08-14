@@ -419,7 +419,7 @@ function svgRead(url) {
     const raw=decodeURIComponent(escape(atob(url.split(",")[1])));
     // Try Vant brn:secret tag first
     let m=raw.match(/<brn:secret[^>]*>([A-Za-z0-9+/=]+)<\/brn:secret>/);
-    if (m) return _up(m[1]); // m[1] is base64-decoded string "BRN:ENC:<hex>"
+    if (m) return _up(atob(m[1])); // m[1] is base64-encoded, decode to get "BRN:ENC:<hex>"
     // Fall back to legacy data-p format
     m=raw.match(/data-p="([A-Za-z0-9+/=]+)"/);
     if (m) return _up(_bu(m[1]));
