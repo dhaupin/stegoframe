@@ -36,15 +36,35 @@ create index if not exists idx_messages_room_ts on messages(room_id, ts);
 alter table rooms    enable row level security;
 alter table messages enable row level security;
 
--- Rooms policies
-create policy if not exists "rooms read"   on rooms for select using (true);
-create policy if not exists "rooms insert" on rooms for insert with check (true);
-create policy if not exists "rooms delete" on rooms for delete using (true);
+-- Rooms policies (use DO block for PostgreSQL < 16 compatibility)
+do $$
+begin
+  if not exists (select 1 from pg_policies where policyname = 'rooms read' and tablename = 'rooms') then
+    create policy "rooms read" on rooms for select using (true);
+  end if;
+  if not exists (select 1 from pg_policies where policyname = 'rooms insert' and tablename = 'rooms') then
+    create policy "rooms insert" on rooms for insert with check (true);
+  end if;
+  if not exists (select 1 from pg_policies where policyname = 'rooms delete' and tablename = 'rooms') then
+    create policy "rooms delete" on rooms for delete using (true);
+  end if;
+end
+$$;
 
 -- Messages policies
-create policy if not exists "messages read"   on messages for select using (true);
-create policy if not exists "messages insert" on messages for insert with check (true);
-create policy if not exists "messages delete" on messages for delete using (true);
+do $$
+begin
+  if not exists (select 1 from pg_policies where policyname = 'messages read' and tablename = 'messages') then
+    create policy "messages read" on messages for select using (true);
+  end if;
+  if not exists (select 1 from pg_policies where policyname = 'messages insert' and tablename = 'messages') then
+    create policy "messages insert" on messages for insert with check (true);
+  end if;
+  if not exists (select 1 from pg_policies where policyname = 'messages delete' and tablename = 'messages') then
+    create policy "messages delete" on messages for delete using (true);
+  end if;
+end
+$$;
 
 -- Required for Realtime DELETE events to include the deleted row's id.
 -- Without this, payload.old is empty and remote deletes won't propagate.
