@@ -140,7 +140,7 @@ function validateCarrier(url) {
 }
 
 // Room ID must be lowercase alphanumeric, 4–16 chars.
-function validateRoomId(id) { return /^[a-z0-9]{4,16}$/.test(id); }
+function validateRoomId(id) { return /^[a-z0-9]{6}$/.test(id); }
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -238,6 +238,20 @@ function recordSend()  { _lastSendTs = Date.now(); }
 
 const _PI=100_000, _SB=16, _IB=12, _BRN="BRN:", _VR="1.0";
 const Enc = Object.freeze({ SVG:"svg", LSB:"lsb" });
+
+// ── Room ID derivation ────────────────────────────────────────────────────────
+// Derive deterministic room ID from passphrase.
+// roomId = first 6 chars of SHA256(passphrase + salt)
+// Salt is versioned so future updates can change derivation without breaking old rooms.
+
+const _ROOM_SALT = "stegoframe-v1";
+
+async function deriveRoomId(passphrase) {
+  const data = new TextEncoder().encode(passphrase + _ROOM_SALT);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  const hex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return hex.substring(0, 6);
+}
 
 // ── Key derivation ────────────────────────────────────────────────────────────
 
@@ -1188,23 +1202,51 @@ function Setup({ onJoin }) {
   const [loading,    setLoading]   = useState(false);
   const [roomExpiry, setRoomExpiry]= useState(null); // prefetched for join screen
   const [uname,      setUname]     = useState(getUsername());
-  const [roomId]                   = useState(isJoining?urlParams.room:makeRoomId());
+  const [derivedRoomId, setDerivedRoomId] = useState(null); // set after entering passphrase
 
-  // Prefetch room expiry for the join screen countdown
+  // For joining: prefetch room expiry and check if room exists
   useEffect(()=>{
-    if(!isJoining)return;
-    sb.from("rooms").select("expires_at").eq("id",roomId).single()
-      .then(({data})=>{ if(data) setRoomExpiry(new Date(data.expires_at).getTime()); });
+    if(!isJoining||!urlParams.room)return;
+    if(!validateRoomId(urlParams.room))return;
+    sb.from("rooms").select("expires_at").eq("id",urlParams.room).single()
+      .then(({data})=>{ 
+        if(data) setRoomExpiry(new Date(data.expires_at).getTime()); 
+        else setErr("room not found");
+      })
+      .catch(()=>setErr("room not found"));
   },[]);
 
   const join=async()=>{
     if(!pass.trim())            {setErr("passphrase required");   return;}
     if(pass.trim().length<4)    {setErr("at least 4 characters"); return;}
-    if(!validateRoomId(roomId)) {setErr("invalid room id");       return;}
     saveUsername(uname);
     setLoading(true); setErr("");
     try{
+      // Derive room ID from passphrase
+      const roomId=await deriveRoomId(pass.trim());
+      if(!validateRoomId(roomId)) {setErr("invalid room id"); setLoading(false); return;}
+      
+      // Ensure room exists in DB
       const {expiresAt}=await dbEnsureRoom(roomId);
+      
+      // If joining, verify passphrase can decrypt (load and try to decode one message)
+      if(isJoining){
+        const rows=await dbLoad(roomId);
+        if(rows.length>0){
+          // Try to decode at least one message to verify passphrase
+          const decoded=await decodeRow(rows[0],pass.trim(),mode);
+          if(!decoded){
+            // Passphrase doesn't match - show generic error
+            setErr("invalid passphrase or no messages");
+            setLoading(false);
+            return;
+          }
+        }
+        // If no messages, that's fine - empty room
+      }
+      
+      // Update derived room ID state (for URL display)
+      setDerivedRoomId(roomId);
       setUrlParams(roomId,mode);
       onJoin({roomId,mode,passphrase:pass.trim(),expiresAt});
     }catch(e){
@@ -1232,16 +1274,23 @@ function Setup({ onJoin }) {
             <div style={{display:"flex",alignItems:"center",gap:8}}>
               {/* Show countdown on join screen if we already know the expiry */}
               {isJoining&&roomExpiry&&<CountdownBadge expiresAt={roomExpiry}/>}
-              <div style={{fontSize:8,color:T.dim,letterSpacing:"0.15em",fontFamily:MONO}}>#{roomId}</div>
+              {/* Show room ID once derived (after entering passphrase) */}
+              {derivedRoomId&&<div style={{fontSize:8,color:T.dim,letterSpacing:"0.15em",fontFamily:MONO}}>#{derivedRoomId}</div>}
             </div>
           </div>
 
           <div style={{padding:20,display:"flex",flexDirection:"column",gap:16}}>
 
-            {isJoining&&(
+            {isJoining&&urlParams.room&&!err&&(
               <div style={{background:T.gd,border:`1px solid ${T.green}`,borderRadius:2,padding:"8px 12px",fontSize:9,color:T.green,lineHeight:1.7,letterSpacing:"0.05em"}}>
-                You've been invited to room <strong>#{roomId}</strong> in {mode.toUpperCase()} mode.
+                You've been invited to a room in {mode.toUpperCase()} mode.
                 Enter the shared passphrase to join.
+              </div>
+            )}
+
+            {isJoining&&err&&(
+              <div style={{background:T.rd,border:`1px solid ${T.red}`,borderRadius:2,padding:"8px 12px",fontSize:9,color:T.red,lineHeight:1.7,letterSpacing:"0.05em"}}>
+                {err}
               </div>
             )}
 
@@ -1309,17 +1358,17 @@ function Setup({ onJoin }) {
               </div>
             )}
 
-            <button onClick={join} disabled={loading} style={{
+            <button onClick={join} disabled={loading||(isJoining&&err)} style={{
               width:"100%",padding:"11px",
               background:loading?T.surf:T.gd,border:`1px solid ${loading?T.b1:T.green}`,color:loading?T.dim:T.green,
-              fontSize:10,letterSpacing:"0.25em",cursor:loading?"not-allowed":"pointer",borderRadius:3,textTransform:"uppercase",
+              fontSize:10,letterSpacing:"0.25em",cursor:(loading||(isJoining&&err))?"not-allowed":"pointer",borderRadius:3,textTransform:"uppercase",
             }}>
-              {loading?"opening room…":(isJoining?"join room →":"create + open room →")}
+              {loading?"opening room…":(isJoining?"join room →":"derive + create room →")}
             </button>
 
             <div style={{fontSize:8,color:T.dim,lineHeight:1.9,letterSpacing:"0.04em",borderTop:`1px solid ${T.b0}`,paddingTop:12}}>
-              The passphrase never leaves your device. Supabase only stores encrypted carrier images —
-              without the passphrase they are indistinguishable from noise.
+              The passphrase never leaves your device. Room URLs are derived from the passphrase — 
+              share the URL to let others join.
             </div>
           </div>
         </div>

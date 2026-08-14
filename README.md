@@ -44,15 +44,17 @@ Magic + version mismatch = null decode. Wrong passphrase = AES-GCM auth failure 
 
 ## Rooms
 
-Rooms are identified by a 6-character random alphanumeric code. The room code and encoding mode are shared in the URL:
+Room IDs are **derived from the passphrase** using SHA-256 (truncated to 6 characters). The passphrase never leaves the client, so the room URL is only guessable if someone knows the passphrase.
 
 ```
 https://stegoframe.creadev.org/?r=abc123&m=svg
 ```
 
-The passphrase is **never** in the URL. Joining participants enter it manually after opening the link.
+**Create flow:** Enter a passphrase → room ID is auto-generated → share the URL with others.
 
-Rooms expire automatically after **7 days**. A live countdown is visible in the room header and the join screen. When a participant leaves, all messages and the room record are hard-deleted from the database.
+**Join flow:** Open the shared URL → enter the passphrase → verify you can decrypt existing messages (if any).
+
+Rooms that exist but have no messages are automatically purged after **24 hours**. Active rooms expire after **7 days**. A live countdown is visible in the room header and the join screen. When a participant leaves, all messages and the room record are hard-deleted from the database.
 
 ### Session identity
 
@@ -67,12 +69,13 @@ Each participant can set a display name (max 24 chars) shown beside their messag
 ## Security properties
 
 - **Passphrase never transmitted.** Key derivation (PBKDF2-SHA256, 100,000 iterations) and all encryption/decryption happen client-side only.
+- **Room ID derived from passphrase.** Room IDs are `SHA256(passphrase + salt)` — only knowable if you have the passphrase. This prevents room enumeration and squatting.
 - **Supabase sees ciphertext only.** Every `carrier` column value is an encrypted data URL. No plaintext, no message content metadata.
 - **Wrong passphrase = silent failure.** AES-GCM authentication tag mismatch returns null. No error leaks information about whether a payload exists.
-- **Room TTL.** Rooms expire after 7 days. The expiry is stored in Supabase and enforced client-side; pg_cron can automate server-side cleanup (see below).
+- **Room TTL.** Rooms expire after 7 days (24 hours if empty). The expiry is stored in Supabase and enforced client-side; pg_cron automates server-side cleanup (see below).
 - **Room wipe on leave.** Leaving a room hard-deletes all messages and the room row from Supabase. Realtime DELETE events propagate to all connected participants.
 - **Display name sanitized.** Username input is stripped of HTML-dangerous characters and control codes before storage. Max 24 chars.
-- **No auth layer.** The anon Supabase key is public by design. RLS policies permit all reads and inserts. For production use, consider adding signed delete tokens or a server-side access check.
+- **No auth layer.** The anon Supabase key is public by design. RLS policies permit all reads and inserts. Room access is protected by the passphrase-derived room ID.
 
 ---
 

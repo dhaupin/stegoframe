@@ -16,6 +16,9 @@ create table if not exists rooms (
 -- Index for expiry queries (if needed)
 create index if not exists idx_rooms_expires_at on rooms(expires_at);
 
+-- Index for empty room cleanup (created_at + existence check)
+create index if not exists idx_rooms_created_at on rooms(created_at);
+
 -- ── Messages table ────────────────────────────────────────────────────────────
 -- Encrypted carrier images + metadata
 create table if not exists messages (
@@ -80,6 +83,17 @@ select cron.schedule(
   'purge-expired-rooms',
   '0 3 * * *',
   $$delete from rooms where expires_at < now()$$
+);
+
+-- ── pg_cron: Auto-purge empty rooms after 24 hours ───────────────────────────
+-- Empty rooms = no messages. Created with passphrase but never used.
+-- Runs every hour to catch abandoned rooms quickly.
+select cron.schedule(
+  'purge-empty-rooms',
+  '0 * * * *',
+  $$delete from rooms 
+   where created_at < now() - interval '24 hours'
+   and not exists (select 1 from messages where room_id = rooms.id)$$
 );
 
 -- ── Enable Realtime ───────────────────────────────────────────────────────────
