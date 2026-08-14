@@ -119,79 +119,27 @@ https://github.com/dhaupin/stegoframe
 
 Go to [supabase.com](https://supabase.com), create a new project.
 
-### 3. Run the SQL
+### 3. Run the Migration
 
-In **Database → SQL Editor**, run the following in full:
+In **Database → SQL Editor**, run the migration file:
 
-```sql
--- Rooms table — tracks room existence and TTL
-create table rooms (
-  id         text primary key,
-  created_at timestamptz not null default now(),
-  expires_at timestamptz not null
-);
-
--- Messages table
-create table messages (
-  id           uuid primary key default gen_random_uuid(),
-  room_id      text not null references rooms(id) on delete cascade,
-  carrier      text not null,
-  mode         text not null default 'svg',
-  sender_id    text not null,
-  display_name text,
-  ts           timestamptz not null default now()
-);
-
--- Index for efficient room queries
-create index on messages(room_id, ts);
-
--- Enable RLS (required — without this all queries return empty)
-alter table rooms    enable row level security;
-alter table messages enable row level security;
-
--- Rooms: allow anon to read + insert + delete
-create policy "rooms read"   on rooms for select using (true);
-create policy "rooms insert" on rooms for insert with check (true);
-create policy "rooms delete" on rooms for delete using (true);
-
--- Messages: allow anon to read + insert + delete
-create policy "messages read"   on messages for select using (true);
-create policy "messages insert" on messages for insert with check (true);
-create policy "messages delete" on messages for delete using (true);
-
--- Required for Realtime DELETE events to include the deleted row's id.
--- Without this, payload.old is empty and remote deletes won't propagate.
-alter table messages replica identity full;
+```bash
+# Or paste the contents of migrations/001_initial.sql
 ```
 
-### 4. (Optional) Auto-purge expired rooms with pg_cron
+This creates tables, RLS policies, indexes, pg_cron schedule, and enables extensions.
 
-Supabase includes [pg_cron](https://supabase.com/docs/guides/cron). Enable it and add a daily cleanup job:
-
-```sql
--- Enable extension (if not already enabled)
-create extension if not exists pg_cron;
-
--- Delete expired rooms + their messages daily at 03:00 UTC
--- The ON DELETE CASCADE on messages.room_id handles message cleanup automatically.
-select cron.schedule(
-  'purge-expired-rooms',
-  '0 3 * * *',
-  $$delete from rooms where expires_at < now()$$
-);
-```
-
-### 5. Enable Realtime
+### 4. Enable Realtime
 
 In **Database → Replication**, enable Realtime for the `messages` table.
 
-### 6. Get credentials
+### 5. Get credentials
 
 In **Project Settings → API**, copy:
 - **Project URL** — looks like `https://abcdefgh.supabase.co`
 - **Publishable anon key** — the `sb_publishable_...` key (newer format) or the legacy JWT anon key. **Do not use the secret key.**
 
-### 7. Connect to Cloudflare Pages
+### 6. Connect to Cloudflare Pages
 
 1. Go to [dash.cloudflare.com](https://dash.cloudflare.com) → Pages → Create a project → Connect to Git
 2. Select your forked repo
@@ -199,7 +147,7 @@ In **Project Settings → API**, copy:
 4. Set output directory: *(empty)*
 5. Click **Save and Deploy**
 
-### 8. Set environment variables
+### 7. Set environment variables
 
 In **Pages → your project → Settings → Environment variables**, add these for both Production and Preview:
 
@@ -210,7 +158,7 @@ In **Pages → your project → Settings → Environment variables**, add these 
 
 Redeploy after setting these (or trigger a new deploy).
 
-### 9. (Optional) Enable Cloudflare KV rate limiting
+### 8. (Optional) Enable Cloudflare KV rate limiting
 
 This limits page loads per IP to prevent bot abuse. If not set up, the app works fine without it.
 
