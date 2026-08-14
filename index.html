@@ -316,27 +316,11 @@ function _pk(p) {
 }
 
 // Parse packet: extract hex payload from BRN:ENC:<hex>
-// Also supports legacy binary format for backward compatibility
 function _up(b) {
   const s = typeof b === 'string' ? b : new TextDecoder().decode(b);
 
-  // Current Vant format: "BRN:ENC:<hex>"
   if (s.startsWith(_BRN + "ENC:")) {
-    const hex = s.slice(_BRN.length + 4);
-    // Return hex string (will be parsed by _ad)
-    return hex;
-  }
-
-  // Legacy binary format: check for SGF magic 0x534746
-  if (typeof b !== 'string' && b.length >= 8) {
-    const magic = (b[0] << 16) | (b[1] << 8) | b[2];
-    if (magic === 0x534746 && b[3] === 0x02) {
-      const len = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7];
-      if (len > 0 && len <= b.length - 8) {
-        // Legacy format - return Uint8Array directly
-        return b.slice(8, 8 + len);
-      }
-    }
+    return s.slice(_BRN.length + 4);
   }
 
   return null;

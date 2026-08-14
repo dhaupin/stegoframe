@@ -128,30 +128,6 @@ describe('Packet Format (BRN:ENC:)', () => {
   it('should return null for invalid format', () => {
     assert.strictEqual(_up('INVALID:PREFIX:data'), null);
   });
-
-  it('should handle legacy SGF binary format', () => {
-    // SGF magic + version + length + payload
-    const legacy = new Uint8Array([
-      0x53, 0x47, 0x46,  // SGF magic
-      0x02,              // version
-      0x00, 0x00, 0x00, 0x04,  // length = 4
-      0xDE, 0xAD, 0xBE, 0xEF   // payload
-    ]);
-    const unpacked = _up(legacy);
-    assert.ok(unpacked instanceof Uint8Array);
-    assert.strictEqual(unpacked.length, 4);
-    assert.strictEqual(_toHex(unpacked), 'deadbeef');
-  });
-
-  it('should reject wrong SGF magic', () => {
-    const invalid = new Uint8Array([0x00, 0x47, 0x46, 0x02, 0x00, 0x00, 0x00, 0x04]);
-    assert.strictEqual(_up(invalid), null);
-  });
-
-  it('should reject wrong SGF version', () => {
-    const invalid = new Uint8Array([0x53, 0x47, 0x46, 0x01, 0x00, 0x00, 0x00, 0x04]);
-    assert.strictEqual(_up(invalid), null);
-  });
 });
 
 describe('AES-GCM Encryption', () => {
