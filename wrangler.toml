@@ -22,9 +22,9 @@ compatibility_flags = ["nodejs_compat"]
 # For Cloudflare Pages (production), bind via the dashboard:
 #   Storage → workers kv → create namespace named "stegoframe"
 #   Pages → your project → Settings → Functions → KV namespace bindings
-#   Variable name: SF_RL
+#   Variable name: SF_KV
 #
 # For local wrangler dev, add to wrangler.toml:
 #   [[kv_namespaces]]
-#   binding = "SF_RL"
+#   binding = "SF_KV"
 #   id = "YOUR_NAMESPACE_ID"

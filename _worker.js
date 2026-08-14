@@ -25,12 +25,12 @@
  *   SUPA_URL   = https://your-project-id.supabase.co
  *   SUPA_ANON  = sb_publishable_...   (publishable/anon key — NOT the secret key)
  *
- * For rate limiting, create a KV namespace named "SF_RL" and bind it:
+ * For rate limiting, create a KV namespace named "SF_KV" and bind it:
  *   Settings → Functions → KV namespace bindings → Add:
- *     Variable name: SF_RL
+ *     Variable name: SF_KV
  *     KV namespace:  stegoframe-rate-limit   (or any name you choose)
  *
- * If SF_RL is not bound, rate limiting is silently skipped (graceful degradation).
+ * If SF_KV is not bound, rate limiting is silently skipped (graceful degradation).
  *
  * ── Rate limit behaviour ──────────────────────────────────────────────────────
  * Window:   60 seconds (sliding, reset per window)
@@ -87,12 +87,12 @@ export default {
       pingSupabase(env);
       // ── Rate limit check ────────────────────────────────────────────────────
       // Skip gracefully if KV namespace is not bound (local dev, misconfigured env).
-      if (env.SF_RL) {
+      if (env.SF_KV) {
         const ip  = request.headers.get("CF-Connecting-IP") ?? "unknown";
         const key = `rl:${ip}`;
 
         try {
-          const raw   = await env.SF_RL.get(key);
+          const raw   = await env.SF_KV.get(key);
           const hits  = raw ? parseInt(raw, 10) : 0;
 
           if (hits >= RL_MAX_HITS) {
@@ -109,11 +109,11 @@ export default {
           // Increment counter. ctx.waitUntil ensures the KV write completes
           // even if the response is sent first (non-blocking fast path).
           ctx.waitUntil(
-            env.SF_RL.put(key, String(hits + 1), { expirationTtl: RL_WINDOW_SEC })
+            env.SF_KV.put(key, String(hits + 1), { expirationTtl: RL_WINDOW_SEC })
           );
         } catch (e) {
           // KV errors (quota, transient) — fail open so the app stays available.
-          console.error("SF_RL rate limit error:", e);
+          console.error("SF_KV rate limit error:", e);
         }
       }
 

@@ -160,7 +160,7 @@ This limits page loads per IP to prevent bot abuse. If not set up, the app works
 
 1. In **Workers & Pages → KV**, create a namespace named `stegoframe`
 2. In **Pages → your project → Settings → Functions → KV namespace bindings**, add:
-   - Variable name: `SF_RL`
+   - Variable name: `SF_KV`
    - KV namespace: `stegoframe`
 3. Redeploy
 
