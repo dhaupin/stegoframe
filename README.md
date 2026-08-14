@@ -233,7 +233,10 @@ The passphrase is never in the URL. The display name is never in the URL.
 ```
 index.html    — entire application (codec + UI + Supabase client)
 _worker.js    — Cloudflare Pages worker (env injection + KV rate limiting)
-wrangler.jsonc — Cloudflare project config
 README.md     — this file
 AGENTS.md     — AI/agent integration reference
+migrations/   — Supabase SQL migrations
+tests/        — codec unit tests
 ```
+
+No build step. No wrangler.toml. KV bindings are configured via the Cloudflare Pages dashboard.

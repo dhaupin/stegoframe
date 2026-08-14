@@ -7,9 +7,9 @@
  *      in index.html at request time using Cloudflare Pages environment variables.
  *      Keeps credentials out of source control without a build step.
  *
- *   2. RATE LIMITING — enforces per-IP request limits using a KV namespace to
- *      prevent bots and abuse from exhausting Supabase free-tier quotas.
- *      Limits are applied to all HTML page loads (room joins/creates).
+ *   2. RATE LIMITING — enforces per-IP request limits to prevent bots and abuse.
+ *      Uses KV when available (distributed, persistent).
+ *      Falls back to in-memory tracking (per-instance, basic protection).
  *
  * ── Why direct connection (no proxy) ─────────────────────────────────────────
  * Supabase Realtime uses persistent WebSocket connections that go from the
@@ -25,18 +25,17 @@
  *   SUPA_URL   = https://your-project-id.supabase.co
  *   SUPA_ANON  = sb_publishable_...   (publishable/anon key — NOT the secret key)
  *
- * For rate limiting, create a KV namespace named "SF_KV" and bind it:
- *   Settings → Functions → KV namespace bindings → Add:
- *     Variable name: SF_KV
- *     KV namespace:  stegoframe-rate-limit   (or any name you choose)
- *
- * If SF_KV is not bound, rate limiting is silently skipped (graceful degradation).
+ * For KV-based rate limiting (recommended for production):
+ *   Create a KV namespace and bind it as SF_KV.
+ *   If not bound, falls back to in-memory rate limiting.
  *
  * ── Rate limit behaviour ──────────────────────────────────────────────────────
  * Window:   60 seconds (sliding, reset per window)
  * Limit:    20 requests per IP per window
  * Response: 429 with Retry-After header on breach
- * Storage:  KV key "rl:{ip}" with 60-second TTL — auto-expires, no cleanup needed
+ *
+ * KV mode:   key "rl:{ip}" with 60-second TTL — distributed across edge nodes
+ * Memory mode: in-memory Map — works without KV but per-instance only
  *
  * This limit applies to HTML page loads only, not to Supabase API calls (which
  * go directly from the browser). For Supabase-level rate limiting, use Supabase
@@ -51,6 +50,9 @@
 // ── Rate limit constants ──────────────────────────────────────────────────────
 const RL_WINDOW_SEC = 60;   // sliding window duration in seconds
 const RL_MAX_HITS   = 20;   // maximum page loads per IP per window
+
+// ── In-memory fallback rate limiter (when KV unavailable) ────────────────────
+const _memRl = new Map();
 
 // ══════════════════════════════════════════════════════════════════════════════
 // KEEPALIVE PING — prevents Supabase free tier from pausing
@@ -85,35 +87,48 @@ export default {
     if (isHtml) {
       // Keep Supabase awake on every page visit
       pingSupabase(env);
-      // ── Rate limit check ────────────────────────────────────────────────────
-      // Skip gracefully if KV namespace is not bound (local dev, misconfigured env).
-      if (env.SF_KV) {
-        const ip  = request.headers.get("CF-Connecting-IP") ?? "unknown";
-        const key = `rl:${ip}`;
 
+      // ── Rate limit check ────────────────────────────────────────────────────
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      const now = Date.now();
+
+      if (env.SF_KV) {
+        // KV-based rate limiting (distributed across edge nodes)
+        const key = `rl:${ip}`;
         try {
-          const raw   = await env.SF_KV.get(key);
-          const hits  = raw ? parseInt(raw, 10) : 0;
+          const raw  = await env.SF_KV.get(key);
+          const hits = raw ? parseInt(raw, 10) : 0;
 
           if (hits >= RL_MAX_HITS) {
-            // Over limit — return 429 with a Retry-After hint
             return new Response("Too Many Requests", {
               status: 429,
-              headers: {
-                "Retry-After":  String(RL_WINDOW_SEC),
-                "Content-Type": "text/plain",
-              },
+              headers: { "Retry-After": String(RL_WINDOW_SEC), "Content-Type": "text/plain" },
             });
           }
-
-          // Increment counter. ctx.waitUntil ensures the KV write completes
-          // even if the response is sent first (non-blocking fast path).
-          ctx.waitUntil(
-            env.SF_KV.put(key, String(hits + 1), { expirationTtl: RL_WINDOW_SEC })
-          );
+          ctx.waitUntil(env.SF_KV.put(key, String(hits + 1), { expirationTtl: RL_WINDOW_SEC }));
         } catch (e) {
-          // KV errors (quota, transient) — fail open so the app stays available.
           console.error("SF_KV rate limit error:", e);
+        }
+      } else {
+        // In-memory fallback (per-instance only, but always-on)
+        // Clean up expired entries on each request (lazy cleanup)
+        if (_memRl.size > 1000) {
+          
+          for (const [k, v] of _memRl) {
+            if (now - v.windowStart > RL_WINDOW_SEC * 1000) _memRl.delete(k);
+          }
+        }
+        const data = _memRl.get(ip);
+        if (data && now - data.windowStart < RL_WINDOW_SEC * 1000) {
+          if (data.hits >= RL_MAX_HITS) {
+            return new Response("Too Many Requests", {
+              status: 429,
+              headers: { "Retry-After": String(RL_WINDOW_SEC), "Content-Type": "text/plain" },
+            });
+          }
+          data.hits++;
+        } else {
+          _memRl.set(ip, { hits: 1, windowStart: now });
         }
       }
 

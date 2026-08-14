@@ -829,7 +829,13 @@ function ChatView({ roomId, mode, passphrase, expiresAt, onLeave }) {
       async row=>{
         if(row.sender_id===SESSION_ID)return; // skip own (already optimistic)
         const m=await decodeRow(row,passphrase,mode);
-        if(m){setMsgs(prev=>[...prev,m]);setMsgCount(c=>c+1);}
+        if(m){
+          setMsgs(prev=>{
+            if(prev.some(x=>x.dbId===row.id))return prev; // dedupe realtime dupes
+            return[...prev,m];
+          });
+          setMsgCount(c=>c+1);
+        }
         setConn("live");
       },
       id=>{setMsgs(prev=>prev.filter(m=>m.dbId!==id));setMsgCount(c=>Math.max(0,c-1));}
