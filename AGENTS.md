@@ -53,35 +53,33 @@ Key derivation: PBKDF2-SHA256
   - iterations: 100,000
   - salt:       16 bytes, random per message
   - key length: 256 bits
-IV:             12 bytes, random per message
+IV:             12 bytes, random per message (standard AES-GCM nonce)
 
-Ciphertext layout (bytes):
-  [0:16]   salt
-  [16:28]  IV
-  [28:]    AES-GCM ciphertext + 16-byte auth tag
+Ciphertext layout (hex-encoded, Vant-compatible):
+  salt:iv:authTag:encrypted
+  (all in lowercase hex, colon-separated)
 ```
 
 ### Binary frame (wraps ciphertext before carrier encoding)
 
 ```
-Offset  Length  Field
-0       3       Magic: 0x53 0x47 0x46 ("SGF")
-3       1       Version: 0x02
-4       8       Payload length: uint32 big-endian
-8       N       Payload: encrypted bytes
+Prefix:         "BRN:ENC:" (Vant-compatible magic)
+Payload:        hex(salt) + ":" + hex(iv) + ":" + hex(authTag) + ":" + hex(encrypted)
 ```
-
-Magic or version mismatch → null decode (silent). AES-GCM auth failure (wrong key) → null decode (silent).
 
 ### SVG carrier
 
-The packed frame (header + ciphertext) is base64-encoded and placed in the `data-p` attribute of a `<desc>` element inside a 100×100 SVG:
+The packed frame is base64-encoded and placed in the `<brn:secret>` tag of a decorative gradient SVG (Vant-compatible):
 
 ```xml
 <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">
-  <desc data-f="2" data-p="BASE64_PAYLOAD_HERE"/>
+  <desc data-f="1.0"/>
+  <brn:secret xmlns:brn="http://steganography.dev/brn">BASE64_OF_BRANE_NC_PREFIXED_HEX</brn:secret>
   <defs>
-    <radialGradient id="g" ...>...</radialGradient>
+    <radialGradient id="g" cx="42%" cy="42%" r="62%">
+      <stop offset="0%" stop-color="hsl(...)"/>
+      <stop offset="100%" stop-color="hsl(...)"/>
+    </radialGradient>
   </defs>
   <rect width="100" height="100" fill="url(#g)"/>
   <!-- decorative circles -->
@@ -93,13 +91,16 @@ Data URL format: `data:image/svg+xml;base64,BASE64_OF_ENTIRE_SVG`
 Extraction:
 ```js
 const svgText = atob(dataUrl.split(",")[1]);
-const match = svgText.match(/data-p="([A-Za-z0-9+/=]+)"/);
-const packedBytes = base64ToBytes(match[1]);
+const match = svgText.match(/<brn:secret[^>]*>([A-Za-z0-9+/=]+)<\/brn:secret>/);
+const packedStr = atob(match[1]); // "BRN:ENC:hex_payload"
+const hexPayload = packedStr.slice(7); // remove "BRN:ENC:"
+const parts = hexPayload.split(":");
+// parts[0] = salt (32 hex), parts[1] = iv (24 hex), parts[2] = authTag (32 hex), parts[3] = encrypted
 ```
 
 ### LSB carrier
 
-The packed frame is encoded into the least-significant bit of the red channel of each pixel in a square noise PNG:
+The packed frame (hex-encoded string "BRN:ENC:...") is encoded into the least-significant bit of the red channel of each pixel in a square noise PNG:
 
 ```
 Pixel layout:  R G B A  (ImageData order)
@@ -333,12 +334,12 @@ Supabase anon:    SUPA_ANON env var (publishable key — sb_publishable_... or l
 Room URL format:  ?r=ROOM_ID&m=svg|lsb
 Sender ID:        sessionStorage key "sf_sid" (browser) or agent-defined UUID
 Display name:     localStorage key "sf_uname" (browser) or agent-defined string
-Magic bytes:      0x53 0x47 0x46 ("SGF")
-Version byte:     0x02
+Magic prefix:     "BRN:ENC:" (Vant-compatible)
+Version:          "1.0"
 PBKDF2 iters:     100,000
-Salt length:      16 bytes
-IV length:        12 bytes
-Header length:    8 bytes
+Salt length:      16 bytes (32 hex chars)
+IV length:        12 bytes (24 hex chars)
+Auth tag:         16 bytes (32 hex chars)
 Min canvas (LSB): 32×32 pixels
 Room TTL:         7 days (604,800,000 ms)
 Max message:      2,000 chars plaintext
@@ -346,4 +347,5 @@ Max carrier:      ~500 KB data URL
 Max room msgs:    500
 Send rate limit:  1 message per second
 Display name max: 24 chars
+Ciphertext format: salt:iv:authTag:encrypted (all hex, colon-separated)
 ```

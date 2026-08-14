@@ -222,18 +222,21 @@ function recordSend()  { _lastSendTs = Date.now(); }
 //        data URL  → extract frame → unpack → decrypt → plaintext
 //
 // Modes:
-//   SVG — payload in <desc data-p="..."> base64 attribute. Looks like abstract art.
+//   SVG — payload in <brn:secret> base64 attribute. Looks like abstract art.
 //   LSB — payload in LSBs of red channel pixels of a noise PNG. Looks like static.
 //
-// Encryption constants:
+// Vant-compatible encryption format:
 //   _PI  PBKDF2 iterations (100,000)
 //   _SB  Salt bytes (16)
-//   _IB  AES-GCM IV bytes (12)
-//   _MG  Magic 0x534746 ("SGF") — frame identifier
-//   _VR  Version byte 0x02
+//   _IB  AES-GCM IV bytes (12) — standard AES-GCM nonce size
+//   _BRN Magic "BRN:ENC:" text prefix (Vant-compatible)
+//   _VR  Version "1.0"
+//
+// Ciphertext layout: salt:iv:authTag:encrypted (hex-encoded, like Vant)
+// Binary frame: "BRN:ENC:" + hex_payload
 // ══════════════════════════════════════════════════════════════════════════════
 
-const _PI=100_000, _SB=16, _IB=12, _MG=0x534746, _VR=0x02;
+const _PI=100_000, _SB=16, _IB=12, _BRN="BRN:", _VR="1.0";
 const Enc = Object.freeze({ SVG:"svg", LSB:"lsb" });
 
 // ── Key derivation ────────────────────────────────────────────────────────────
@@ -251,42 +254,92 @@ async function _dk(p, s) {
   );
 }
 
-// @returns  Uint8Array: [salt(16)] + [iv(12)] + [ciphertext + 16-byte auth tag]
-async function _ae(txt, p) {
-  const s=crypto.getRandomValues(new Uint8Array(_SB));
-  const iv=crypto.getRandomValues(new Uint8Array(_IB));
-  const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv}, await _dk(p,s), new TextEncoder().encode(txt));
-  const o=new Uint8Array(_SB+_IB+ct.byteLength);
-  o.set(s); o.set(iv,_SB); o.set(new Uint8Array(ct),_SB+_IB);
-  return o;
+// Hex encoding helpers (Vant uses hex encoding)
+function _toHex(buf) {
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+function _fromHex(hex) {
+  const buf = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < buf.length; i++) buf[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return buf;
+}
+
+// @returns  hex string: salt:iv:authTag:encrypted (Vant-compatible format)
+async function _ae(txt, p) {
+  const s = crypto.getRandomValues(new Uint8Array(_SB));
+  const iv = crypto.getRandomValues(new Uint8Array(_IB));
+  const ek = await _dk(p, s);
+  const ct = await crypto.subtle.encrypt({name:"AES-GCM", iv}, ek, new TextEncoder().encode(txt));
+  const ctArr = new Uint8Array(ct);
+  // GCM appends auth tag to ciphertext - last 16 bytes
+  const encrypted = ctArr.slice(0, ctArr.byteLength - 16);
+  const authTag = ctArr.slice(ctArr.byteLength - 16);
+  // Format: salt:iv:authTag:encrypted (all hex)
+  return _toHex(s) + ":" + _toHex(iv) + ":" + _toHex(authTag) + ":" + _toHex(encrypted);
+}
+
+// @param d  hex string or Uint8Array with salt:iv:authTag:encrypted
 // @returns  plaintext string, or null on wrong key / tampered data (silent failure)
 // @why  Silent null — AES-GCM auth tag failure reveals nothing about whether
 //       a payload exists. The carrier just appears empty.
 async function _ad(d, p) {
   try {
+    let hex = typeof d === 'string' ? d : _toHex(d);
+    const parts = hex.split(":");
+    if (parts.length !== 4) return null;
+    const s = _fromHex(parts[0]);
+    const iv = _fromHex(parts[1]);
+    const authTag = _fromHex(parts[2]);
+    const encrypted = _fromHex(parts[3]);
+    // Reconstruct GCM ciphertext: encrypted + authTag
+    const ct = new Uint8Array(encrypted.byteLength + authTag.byteLength);
+    ct.set(encrypted, 0);
+    ct.set(authTag, encrypted.byteLength);
+    const ek = await _dk(p, s);
     return new TextDecoder().decode(
-      await crypto.subtle.decrypt({name:"AES-GCM",iv:d.slice(_SB,_SB+_IB)}, await _dk(p,d.slice(0,_SB)), d.slice(_SB+_IB))
+      await crypto.subtle.decrypt({name:"AES-GCM", iv}, ek, ct)
     );
   } catch { return null; }
 }
 
-// ── Binary frame (8-byte header wraps every payload before carrier embedding) ─
+// ── Vant-compatible packet format ──────────────────────────────────────────────
+// Format: "BRN:ENC:<hex_payload>" (matches vant lib/stego.js exactly)
+// Payload is hex string of salt:iv:authTag:encrypted
+// ──────────────────────────────────────────────────────────────────────────────
+// Backward compatibility: also supports legacy SGF binary format
 // [0-2] Magic 0x53 0x47 0x46 | [3] Version | [4-7] uint32 length BE | [8+] payload
 
 function _pk(p) {
-  const b=new Uint8Array(8+p.length);
-  b[0]=(_MG>>16)&0xFF; b[1]=(_MG>>8)&0xFF; b[2]=_MG&0xFF; b[3]=_VR;
-  const l=p.length;
-  b[4]=(l>>24)&0xFF; b[5]=(l>>16)&0xFF; b[6]=(l>>8)&0xFF; b[7]=l&0xFF;
-  b.set(p,8); return b;
+  // p is hex string from _ae - wrap with BRN:ENC: prefix
+  return _BRN + "ENC:" + p;
 }
+
+// Parse packet: extract hex payload from BRN:ENC:<hex>
+// Also supports legacy binary format for backward compatibility
 function _up(b) {
-  if(b.length<8) return null;
-  if(((b[0]<<16)|(b[1]<<8)|b[2])!==_MG||b[3]!==_VR) return null;
-  const l=(b[4]<<24)|(b[5]<<16)|(b[6]<<8)|b[7];
-  return(l>0&&l<=b.length-8)?b.slice(8,8+l):null;
+  const s = typeof b === 'string' ? b : new TextDecoder().decode(b);
+
+  // Current Vant format: "BRN:ENC:<hex>"
+  if (s.startsWith(_BRN + "ENC:")) {
+    const hex = s.slice(_BRN.length + 4);
+    // Return hex string (will be parsed by _ad)
+    return hex;
+  }
+
+  // Legacy binary format: check for SGF magic 0x534746
+  if (typeof b !== 'string' && b.length >= 8) {
+    const magic = (b[0] << 16) | (b[1] << 8) | b[2];
+    if (magic === 0x534746 && b[3] === 0x02) {
+      const len = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7];
+      if (len > 0 && len <= b.length - 8) {
+        // Legacy format - return Uint8Array directly
+        return b.slice(8, 8 + len);
+      }
+    }
+  }
+
+  return null;
 }
 
 // ── Base64 / bit helpers ──────────────────────────────────────────────────────
@@ -340,16 +393,20 @@ async function lsbRead(url) {
 
 // ── SVG carrier ───────────────────────────────────────────────────────────────
 
-// Embeds payload in <desc data-p="..."> of a decorative gradient SVG.
+// Embeds payload in <brn:secret> of a decorative gradient SVG (Vant-compatible).
 // @why  btoa(unescape(encodeURIComponent(...))) — handles multi-byte UTF-8 safely.
 function svgWrite(payload) {
-  const b64=_ub(_pk(payload));
+  // payload is hex string, _pk wraps it with BRN:ENC: prefix
+  const b64=btoa(_pk(payload));
   const h=Math.floor(Math.random()*360), h2=(h+137)%360;
-  const els=Array.from({length:5},(_,i)=>
+  // Variable decorative elements for visual noise
+  const numEls=4+Math.floor(Math.random()*5);
+  const els=Array.from({length:numEls},(_,i)=>
     `<circle cx="${(8+Math.random()*84).toFixed(1)}" cy="${(8+Math.random()*84).toFixed(1)}" r="${(2+Math.random()*8).toFixed(1)}" fill="hsla(${(h+i*43)%360},45%,60%,0.1)"/>`
   ).join("");
   const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">`
-    +`<desc data-f="${_VR}" data-p="${b64}"/>`
+    +`<desc data-f="${_VR}"/>`
+    +`<brn:secret xmlns:brn="http://steganography.dev/brn">${b64}</brn:secret>`
     +`<defs><radialGradient id="g" cx="42%" cy="42%" r="62%">`
     +`<stop offset="0%" stop-color="hsl(${h},50%,62%)"/>`
     +`<stop offset="100%" stop-color="hsl(${h2},42%,18%)"/>`
@@ -360,8 +417,13 @@ function svgWrite(payload) {
 function svgRead(url) {
   try {
     const raw=decodeURIComponent(escape(atob(url.split(",")[1])));
-    const m=raw.match(/data-p="([A-Za-z0-9+/=]+)"/);
-    return m?_up(_bu(m[1])):null;
+    // Try Vant brn:secret tag first
+    let m=raw.match(/<brn:secret[^>]*>([A-Za-z0-9+/=]+)<\/brn:secret>/);
+    if (m) return _up(m[1]); // m[1] is base64-decoded string "BRN:ENC:<hex>"
+    // Fall back to legacy data-p format
+    m=raw.match(/data-p="([A-Za-z0-9+/=]+)"/);
+    if (m) return _up(_bu(m[1]));
+    return null;
   } catch { return null; }
 }
 
@@ -380,7 +442,11 @@ const Codec = {
   },
   sniff(url) {
     if(!url) return Enc.SVG;
-    try{const p=atob(url.split(",")[1]).slice(0,64);if(p.includes("<svg"))return Enc.SVG;}catch{}
+    try{
+      const raw=atob(url.split(",")[1]).slice(0,128);
+      if(raw.includes("<svg")) return Enc.SVG;
+      if(raw.includes("PNG")) return Enc.LSB; // PNG magic bytes
+    }catch{}
     return Enc.LSB;
   },
 };
