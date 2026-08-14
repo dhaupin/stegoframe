@@ -19,16 +19,12 @@ compatibility_flags = ["nodejs_compat"]
 # KV namespace for rate limiting (optional)
 # If not bound, the worker silently skips rate limiting.
 #
-# To use locally with wrangler dev:
-#   1. wrangler kv namespace create stegoframe
-#   2. Replace "YOUR_NAMESPACE_ID" below with the returned id
-#
-# For Cloudflare Pages (production), bind via the dashboard instead:
-#   Storage → workers kv → create instance
+# For Cloudflare Pages (production), bind via the dashboard:
+#   Storage → workers kv → create namespace named "stegoframe"
 #   Pages → your project → Settings → Functions → KV namespace bindings
 #   Variable name: SF_RL
 #
-# The id below is only used by `wrangler dev` — Pages ignores it.
-[[kv_namespaces]]
-binding = "SF_RL"
-id = "YOUR_NAMESPACE_ID"
+# For local wrangler dev, add to wrangler.toml:
+#   [[kv_namespaces]]
+#   binding = "SF_RL"
+#   id = "YOUR_NAMESPACE_ID"
