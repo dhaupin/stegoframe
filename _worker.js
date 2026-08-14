@@ -53,47 +53,6 @@ const RL_WINDOW_SEC = 60;   // sliding window duration in seconds
 const RL_MAX_HITS   = 20;   // maximum page loads per IP per window
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SCHEDULED CLEANUP — runs periodically to clean up expired rooms
-// ──────────────────────────────────────────────────────────────────────────────
-// Prevents orphaned rooms from accumulating. Runs every 10 minutes.
-// Only deletes rooms that are actually expired (expires_at < now()).
-// Uses a simple in-memory lock to prevent concurrent cleanup runs.
-// ══════════════════════════════════════════════════════════════════════════════
-let lastCleanup = 0;
-const CLEANUP_LOCK_MS = 60_000; // 1 minute lock to prevent overlapping runs
-
-async function cleanupExpiredRooms(env) {
-  const now = Date.now();
-  if (now - lastCleanup < CLEANUP_LOCK_MS) return; // Skip if recently ran
-  lastCleanup = now;
-
-  if (!env.SUPA_URL || !env.SUPA_ANON) {
-    console.log("[stegoframe] Skipping cleanup: Supabase not configured");
-    return;
-  }
-
-  try {
-    // Delete expired rooms (and their messages via CASCADE)
-    const resp = await fetch(`${env.SUPA_URL}/rest/v1/rooms?expires_at=lt.${new Date().toISOString()}`, {
-      method: "DELETE",
-      headers: {
-        "apikey": env.SUPA_ANON,
-        "Authorization": `Bearer ${env.SUPA_ANON}`,
-        "Prefer": "return=minimal"
-      }
-    });
-    
-    if (resp.ok) {
-      console.log("[stegoframe] Expired rooms cleaned up");
-    } else {
-      console.log("[stegoframe] Cleanup response:", resp.status);
-    }
-  } catch (e) {
-    console.error("[stegoframe] Cleanup error:", e.message);
-  }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
 // KEEPALIVE PING — prevents Supabase free tier from pausing
 // ──────────────────────────────────────────────────────────────────────────────
 // Runs on every HTML request. A simple SELECT 1 keeps the DB awake.
@@ -182,15 +141,5 @@ export default {
 
     // All non-HTML requests pass through to the Pages asset pipeline untouched
     return env.ASSETS.fetch(request);
-  },
-
-  // ══════════════════════════════════════════════════════════════════════════════
-  // SCHEDULED EVENT — for Cloudflare Scheduled Workers
-  // ──────────────────────────────────────────────────────────────────────────────
-  // Runs every 10 minutes via wrangler.toml cron config.
-  // Cleans up expired rooms to prevent database bloat.
-  // ══════════════════════════════════════════════════════════════════════════════
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(cleanupExpiredRooms(env));
   },
 };
