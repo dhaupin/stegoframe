@@ -996,9 +996,17 @@ function ChatView({ roomId, mode, passphrase, expiresAt, onLeave }) {
 
   // ── Leave / room wipe ────────────────────────────────────────────────────────
   const [leaveConfirm,setLeaveConfirm]=useState(false);
+  const [wipeError,setWipeError]=useState(null);
   const confirmLeave=async()=>{
-    try{await dbDeleteRoom(roomId);}catch(e){console.error("wipe failed",e);}
-    setLeaveConfirm(false);onLeave();
+    setWipeError(null);
+    try{
+      await dbDeleteRoom(roomId);
+      setLeaveConfirm(false);
+      onLeave();
+    }catch(e){
+      console.error("wipe failed",e);
+      setWipeError("Delete failed: "+e.message);
+    }
   };
 
   const connColor={connecting:T.amber,live:T.green,error:T.red}[connState]??T.dim;
@@ -1146,9 +1154,10 @@ function ChatView({ roomId, mode, passphrase, expiresAt, onLeave }) {
               This will <strong style={{color:T.bright}}>permanently delete all messages</strong> in room{" "}
               <strong style={{color:T.bright}}>#{roomId}</strong> for all participants. Cannot be undone.
             </div>
+            {wipeError&&<div style={{fontSize:11,color:T.red,marginBottom:12,padding:8,background:T.rd,borderRadius:2}}>{wipeError}</div>}
             <div style={{display:"flex",gap:8}}>
               <button onClick={confirmLeave} style={{flex:1,padding:"10px",background:T.rd,border:`1px solid ${T.red}`,color:T.red,fontSize:9,letterSpacing:"0.2em",cursor:"pointer",borderRadius:2,textTransform:"uppercase"}}>delete all + leave</button>
-              <button onClick={()=>setLeaveConfirm(false)} style={{flex:1,padding:"10px",background:"transparent",border:`1px solid ${T.b1}`,color:T.sub,fontSize:9,letterSpacing:"0.2em",cursor:"pointer",borderRadius:2,textTransform:"uppercase"}}>cancel</button>
+              <button onClick={()=>{setLeaveConfirm(false);setWipeError(null);}} style={{flex:1,padding:"10px",background:"transparent",border:`1px solid ${T.b1}`,color:T.sub,fontSize:9,letterSpacing:"0.2em",cursor:"pointer",borderRadius:2,textTransform:"uppercase"}}>cancel</button>
             </div>
           </div>
         </div>
