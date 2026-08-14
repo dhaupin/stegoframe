@@ -20,7 +20,7 @@ compatibility_flags = ["nodejs_compat"]
 # If not bound, the worker silently skips rate limiting.
 #
 # To use locally with wrangler dev:
-#   1. wrangler kv namespace create stegoframe-rate-limit
+#   1. wrangler kv namespace create stegoframe
 #   2. Replace "YOUR_NAMESPACE_ID" below with the returned id
 #
 # For Cloudflare Pages (production), bind via the dashboard instead:

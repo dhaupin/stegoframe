@@ -47,7 +47,7 @@ Magic + version mismatch = null decode. Wrong passphrase = AES-GCM auth failure 
 Rooms are identified by a 6-character random alphanumeric code. The room code and encoding mode are shared in the URL:
 
 ```
-https://stegoframe.pages.dev/?r=abc123&m=svg
+https://stegoframe.creadev.org/?r=abc123&m=svg
 ```
 
 The passphrase is **never** in the URL. Joining participants enter it manually after opening the link.
@@ -121,11 +121,7 @@ Go to [supabase.com](https://supabase.com), create a new project.
 
 ### 3. Run the Migration
 
-In **Database → SQL Editor**, run the migration file:
-
-```bash
-# Or paste the contents of migrations/001_initial.sql
-```
+In **Database → SQL Editor**, run the migration file `migrations/001_initial.sql` (or paste its contents).
 
 This creates tables, RLS policies, indexes, pg_cron schedule, and enables extensions.
 
@@ -162,10 +158,10 @@ Redeploy after setting these (or trigger a new deploy).
 
 This limits page loads per IP to prevent bot abuse. If not set up, the app works fine without it.
 
-1. In **Workers & Pages → KV**, create a namespace named `stegoframe-rate-limit`
+1. In **Workers & Pages → KV**, create a namespace named `stegoframe`
 2. In **Pages → your project → Settings → Functions → KV namespace bindings**, add:
    - Variable name: `SF_RL`
-   - KV namespace: `stegoframe-rate-limit`
+   - KV namespace: `stegoframe`
 3. Redeploy
 
 The worker rate-limits to **20 page loads per IP per 60 seconds** by default. This applies to initial page loads only — Supabase API calls go directly from the browser and are not affected. Adjust `RL_WINDOW_SEC` and `RL_MAX_HITS` in `_worker.js` to tune the limits.
