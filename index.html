@@ -329,7 +329,6 @@ function _up(b) {
 // ── Base64 / bit helpers ──────────────────────────────────────────────────────
 // @why  Manual loops because btoa/atob work on binary strings, not typed arrays.
 
-function _ub(b){let s="";for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s);}
 function _bu(s){const b=atob(s),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a;}
 function _b2B(bits){
   const b=new Uint8Array(Math.floor(bits.length/8));
@@ -401,12 +400,8 @@ function svgWrite(payload) {
 function svgRead(url) {
   try {
     const raw=decodeURIComponent(escape(atob(url.split(",")[1])));
-    // Try Vant brn:secret tag first
-    let m=raw.match(/<brn:secret[^>]*>([A-Za-z0-9+/=]+)<\/brn:secret>/);
-    if (m) return _up(atob(m[1])); // m[1] is base64-encoded, decode to get "BRN:ENC:<hex>"
-    // Fall back to legacy data-p format
-    m=raw.match(/data-p="([A-Za-z0-9+/=]+)"/);
-    if (m) return _up(_bu(m[1]));
+    const m=raw.match(/<brn:secret[^>]*>([A-Za-z0-9+/=]+)<\/brn:secret>/);
+    if (m) return _up(atob(m[1]));
     return null;
   } catch { return null; }
 }
