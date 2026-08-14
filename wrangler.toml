@@ -11,10 +11,10 @@ observability = { enabled = true }
 # Compatibility flags
 compatibility_flags = ["nodejs_compat"]
 
-# Scheduled trigger — runs every 10 minutes to clean up expired rooms
-# Keeps the worker scheduled even on free tier (included in 100K/day limit)
-[triggers]
-crons = ["*/10 * * * *"]
+# Note: Room cleanup uses Supabase pg_cron, not Cloudflare scheduled triggers.
+# See README.md for pg_cron setup:
+#   select cron.schedule('purge-expired-rooms', '0 3 * * *',
+#     $$delete from rooms where expires_at < now()$$);
 
 # KV namespace for rate limiting (optional)
 # If not bound, the worker silently skips rate limiting.
