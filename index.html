@@ -329,12 +329,6 @@ function _up(b) {
 // ── Base64 / bit helpers ──────────────────────────────────────────────────────
 // @why  Manual loops because btoa/atob work on binary strings, not typed arrays.
 
-function _bu(s){const b=atob(s),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a;}
-function _b2B(bits){
-  const b=new Uint8Array(Math.floor(bits.length/8));
-  for(let i=0;i<b.length;i++){let v=0;for(let j=0;j<8;j++)v=(v<<1)|bits[i*8+j];b[i]=v;}
-  return b;
-}
 
 // ── LSB carrier ───────────────────────────────────────────────────────────────
 
