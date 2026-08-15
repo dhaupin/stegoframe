@@ -1,100 +1,19 @@
 /**
  * Stegoframe Codec Tests
  * Run with: npm test
- * Or: node --test tests/codec.test.mjs
  */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-
-// ── Constants (must match index.html) ────────────────────────────────────────
-const _PI = 100_000;  // PBKDF2 iterations
-const _SB = 16;       // salt bytes
-const _IB = 12;       // IV bytes
-const _BRN = "BRN:";  // packet prefix
-
-// ── Copy of codec functions from index.html for testing ──────────────────────
-
-const _ROOM_SALT = "stegoframe-v1";
-
-async function deriveRoomId(passphrase) {
-  const data = new TextEncoder().encode(passphrase + _ROOM_SALT);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  const hex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
-  return hex.substring(0, 6);
-}
-
-function _toHex(buf) {
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-function _fromHex(hex) {
-  const buf = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < buf.length; i++) buf[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return buf;
-}
-
-async function _dk(p, s) {
-  const k = await crypto.subtle.importKey(
-    "raw", new TextEncoder().encode(p), { name: "PBKDF2" }, false, ["deriveKey"]
-  );
-  return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: s, iterations: _PI, hash: "SHA-256" },
-    k, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
-  );
-}
-
-async function _ae(txt, p) {
-  const s = crypto.getRandomValues(new Uint8Array(_SB));
-  const iv = crypto.getRandomValues(new Uint8Array(_IB));
-  const ek = await _dk(p, s);
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, ek, new TextEncoder().encode(txt));
-  const ctArr = new Uint8Array(ct);
-  const encrypted = ctArr.slice(0, ctArr.byteLength - 16);
-  const authTag = ctArr.slice(ctArr.byteLength - 16);
-  return _toHex(s) + ":" + _toHex(iv) + ":" + _toHex(authTag) + ":" + _toHex(encrypted);
-}
-
-async function _ad(d, p) {
-  try {
-    let hex = typeof d === 'string' ? d : _toHex(d);
-    const parts = hex.split(":");
-    if (parts.length !== 4) return null;
-    const s = _fromHex(parts[0]);
-    const iv = _fromHex(parts[1]);
-    const authTag = _fromHex(parts[2]);
-    const encrypted = _fromHex(parts[3]);
-    const ct = new Uint8Array(encrypted.byteLength + authTag.byteLength);
-    ct.set(encrypted, 0);
-    ct.set(authTag, encrypted.byteLength);
-    const ek = await _dk(p, s);
-    return new TextDecoder().decode(
-      await crypto.subtle.decrypt({ name: "AES-GCM", iv }, ek, ct)
-    );
-  } catch { return null; }
-}
-
-function _pk(p) {
-  return _BRN + "ENC:" + p;
-}
-
-function _up(b) {
-  const s = typeof b === 'string' ? b : new TextDecoder().decode(b);
-  if (s.startsWith(_BRN + "ENC:")) {
-    const hex = s.slice(_BRN.length + 4);
-    return hex;
-  }
-  if (typeof b !== 'string' && b.length >= 8) {
-    const magic = (b[0] << 16) | (b[1] << 8) | b[2];
-    if (magic === 0x534746 && b[3] === 0x02) {
-      const len = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7];
-      if (len > 0 && len <= b.length - 8) {
-        return b.slice(8, 8 + len);
-      }
-    }
-  }
-  return null;
-}
+import { randomBytes } from 'node:crypto';
+import {
+  deriveRoomId,
+  _PI, _SB, _IB, _BRN,
+  _toHex, _fromHex,
+  _pk, _up,
+  _ae, _ad,
+  _b2B,
+} from '../codec.js';
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -113,7 +32,7 @@ describe('Hex Encoding', () => {
   });
 
   it('should round-trip hex encoding', () => {
-    const original = crypto.getRandomValues(new Uint8Array(32));
+    const original = new Uint8Array(randomBytes(32));
     const hex = _toHex(original);
     const decoded = _fromHex(hex);
     assert.deepStrictEqual(decoded, original);
@@ -234,6 +153,25 @@ describe('Full Codec Round-trip', () => {
     // Decrypt
     const decrypted = await _ad(unpacked, passphrase);
     assert.strictEqual(decrypted, plaintext);
+  });
+});
+
+describe('Bit Conversion (_b2B)', () => {
+  it('should convert bits to bytes', () => {
+    // 8 bits: 01000001 = 'A'
+    const bits = [0, 1, 0, 0, 0, 0, 0, 1];
+    const bytes = _b2B(bits);
+    assert.strictEqual(bytes.length, 1);
+    assert.strictEqual(bytes[0], 65); // 'A'
+  });
+
+  it('should handle partial last byte', () => {
+    // 5 bits: 01000 = 'H' (upper 5 bits of byte)
+    // Binary: 0b01000000 = 64
+    const bits = [0, 1, 0, 0, 0];
+    const bytes = _b2B(bits);
+    assert.strictEqual(bytes.length, 1);
+    assert.strictEqual(bytes[0], 64); // Upper 5 bits of byte
   });
 });
 
