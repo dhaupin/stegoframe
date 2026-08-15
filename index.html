@@ -317,12 +317,9 @@ async function _ad(d, p) {
   } catch { return null; }
 }
 
-// ── Vant-compatible packet format ──────────────────────────────────────────────
-// Format: "BRN:ENC:<hex_payload>" (matches vant lib/stego.js exactly)
+// ── Packet format ─────────────────────────────────────────────────────────────
+// Format: "BRN:ENC:<hex_payload>" (Vant-compatible)
 // Payload is hex string of salt:iv:authTag:encrypted
-// ──────────────────────────────────────────────────────────────────────────────
-// Backward compatibility: also supports legacy SGF binary format
-// [0-2] Magic 0x53 0x47 0x46 | [3] Version | [4-7] uint32 length BE | [8+] payload
 
 function _pk(p) {
   // p is hex string from _ae - wrap with BRN:ENC: prefix
