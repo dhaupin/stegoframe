@@ -228,7 +228,7 @@ function recordSend()  { _lastSendTs = Date.now(); }
 // Vant-compatible encryption format:
 //   _PI  PBKDF2 iterations (100,000)
 //   _SB  Salt bytes (16)
-//   _IB  AES-GCM IV bytes (12) — standard AES-GCM nonce size
+//   _IB  AES-GCM IV bytes (16) — full AES block size, matches Vant format
 //   _BRN Magic "BRN:ENC:" text prefix (Vant-compatible)
 //   _VR  Version "1.0"
 //
@@ -236,7 +236,7 @@ function recordSend()  { _lastSendTs = Date.now(); }
 // Binary frame: "BRN:ENC:" + hex_payload
 // ══════════════════════════════════════════════════════════════════════════════
 
-const _PI=100_000, _SB=16, _IB=12, _BRN="BRN:", _VR="1.0";
+const _PI=100_000, _SB=16, _IB=16, _BRN="BRN:", _VR="1.0";
 const Enc = Object.freeze({ SVG:"svg", LSB:"lsb" });
 
 // ── Room ID derivation ────────────────────────────────────────────────────────
