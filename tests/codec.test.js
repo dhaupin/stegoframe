@@ -6,14 +6,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { randomBytes } from 'node:crypto';
-import {
-  deriveRoomId,
-  _PI, _SB, _IB, _BRN,
-  _toHex, _fromHex,
-  _pk, _up,
-  _ae, _ad,
-  _b2B,
-} from '../codec.js';
+import { Codec, SALT_BYTES, IV_BYTES, deriveRoomId, _ae, _ad, _pk, _up, _toHex, _fromHex, _b2B } from '../lib/codec.js';
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -63,16 +56,16 @@ describe('AES-GCM Encryption', () => {
     const plaintext = 'Hello, Stegoframe!';
     const passphrase = 'secret123';
 
-    const encrypted = await _ae(plaintext, passphrase);
+    const encrypted = await Codec.encrypt(plaintext, passphrase);
     assert.ok(encrypted.includes(':'), 'Encrypted should be colon-separated');
     
     const parts = encrypted.split(':');
     assert.strictEqual(parts.length, 4, 'Should have 4 parts');
-    assert.strictEqual(parts[0].length, _SB * 2, 'Salt should be 32 hex chars');
-    assert.strictEqual(parts[1].length, _IB * 2, 'IV should be 24 hex chars');
+    assert.strictEqual(parts[0].length, SALT_BYTES * 2, 'Salt should be 32 hex chars');
+    assert.strictEqual(parts[1].length, IV_BYTES * 2, 'IV should be 24 hex chars');
     assert.strictEqual(parts[2].length, 32, 'Auth tag should be 32 hex chars');
 
-    const decrypted = await _ad(encrypted, passphrase);
+    const decrypted = await Codec.decrypt(encrypted, passphrase);
     assert.strictEqual(decrypted, plaintext);
   });
 
@@ -80,24 +73,24 @@ describe('AES-GCM Encryption', () => {
     const plaintext = 'Same message';
     const passphrase = 'same-passphrase';
 
-    const encrypted1 = await _ae(plaintext, passphrase);
-    const encrypted2 = await _ae(plaintext, passphrase);
+    const encrypted1 = await Codec.encrypt(plaintext, passphrase);
+    const encrypted2 = await Codec.encrypt(plaintext, passphrase);
 
     assert.notStrictEqual(encrypted1, encrypted2, 'Same message should produce different ciphertext');
 
     // But both should decrypt to same plaintext
-    assert.strictEqual(await _ad(encrypted1, passphrase), plaintext);
-    assert.strictEqual(await _ad(encrypted2, passphrase), plaintext);
+    assert.strictEqual(await Codec.decrypt(encrypted1, passphrase), plaintext);
+    assert.strictEqual(await Codec.decrypt(encrypted2, passphrase), plaintext);
   });
 
   it('should return null with wrong passphrase', async () => {
-    const encrypted = await _ae('Secret message', 'correct-pass');
-    const decrypted = await _ad(encrypted, 'wrong-pass');
+    const encrypted = await Codec.encrypt('Secret message', 'correct-pass');
+    const decrypted = await Codec.decrypt(encrypted, 'wrong-pass');
     assert.strictEqual(decrypted, null);
   });
 
   it('should return null for tampered ciphertext', async () => {
-    const encrypted = await _ae('Original message', 'pass');
+    const encrypted = await Codec.encrypt('Original message', 'pass');
     const parts = encrypted.split(':');
     // Tamper with the encrypted part - change last char
     const lastIdx = parts[3].length - 1;
@@ -105,13 +98,13 @@ describe('AES-GCM Encryption', () => {
     const tamperedChar = originalChar === '0' ? '1' : '0';
     const tamperedHex = parts[3].slice(0, lastIdx) + tamperedChar;
     const tampered = parts.slice(0, 3).concat(tamperedHex).join(':');
-    const decrypted = await _ad(tampered, 'pass');
+    const decrypted = await Codec.decrypt(tampered, 'pass');
     assert.strictEqual(decrypted, null);
   });
 
   it('should handle empty string', async () => {
-    const encrypted = await _ae('', 'pass');
-    const decrypted = await _ad(encrypted, 'pass');
+    const encrypted = await Codec.encrypt('', 'pass');
+    const decrypted = await Codec.decrypt(encrypted, 'pass');
     assert.strictEqual(decrypted, '');
   });
 
@@ -119,8 +112,8 @@ describe('AES-GCM Encryption', () => {
     const plaintext = 'Hello 🌍 你好 🎉';
     const passphrase = 'unicode-test';
 
-    const encrypted = await _ae(plaintext, passphrase);
-    const decrypted = await _ad(encrypted, passphrase);
+    const encrypted = await Codec.encrypt(plaintext, passphrase);
+    const decrypted = await Codec.decrypt(encrypted, passphrase);
     assert.strictEqual(decrypted, plaintext);
   });
 
@@ -128,8 +121,8 @@ describe('AES-GCM Encryption', () => {
     const plaintext = 'A'.repeat(10000);
     const passphrase = 'long-message-test';
 
-    const encrypted = await _ae(plaintext, passphrase);
-    const decrypted = await _ad(encrypted, passphrase);
+    const encrypted = await Codec.encrypt(plaintext, passphrase);
+    const decrypted = await Codec.decrypt(encrypted, passphrase);
     assert.strictEqual(decrypted, plaintext);
   });
 });
@@ -140,7 +133,7 @@ describe('Full Codec Round-trip', () => {
     const passphrase = 'round-trip-pass';
 
     // Encrypt
-    const encrypted = await _ae(plaintext, passphrase);
+    const encrypted = await Codec.encrypt(plaintext, passphrase);
     
     // Pack
     const packed = _pk(encrypted);
@@ -151,7 +144,7 @@ describe('Full Codec Round-trip', () => {
     assert.strictEqual(unpacked, encrypted);
 
     // Decrypt
-    const decrypted = await _ad(unpacked, passphrase);
+    const decrypted = await Codec.decrypt(unpacked, passphrase);
     assert.strictEqual(decrypted, plaintext);
   });
 });
@@ -210,5 +203,16 @@ describe('Room ID Derivation', () => {
     const roomId = await deriveRoomId('');
     assert.strictEqual(roomId.length, 6);
     assert.ok(/^[a-z0-9]+$/.test(roomId));
+  });
+});
+
+describe('Codec Class API', () => {
+  it('should have static methods', () => {
+    assert.ok(typeof Codec.deriveRoomId === 'function');
+    assert.ok(typeof Codec.encrypt === 'function');
+    assert.ok(typeof Codec.decrypt === 'function');
+    assert.ok(typeof Codec.encode === 'function');
+    assert.ok(typeof Codec.decode === 'function');
+    assert.ok(typeof Codec.sniff === 'function');
   });
 });
