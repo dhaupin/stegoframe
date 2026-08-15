@@ -342,6 +342,15 @@ function _up(b) {
 
 // ── Bit helpers ───────────────────────────────────────────────────────────────
 
+function _b2B(bits) {
+  const bytes=new Uint8Array(Math.ceil(bits.length/8));
+  for(let i=0;i<bits.length;i++){
+    const byteIdx=Math.floor(i/8), bitIdx=7-(i%8);
+    bytes[byteIdx]|=(bits[i]&1)<<bitIdx;
+  }
+  return bytes;
+}
+
 // ── LSB carrier ───────────────────────────────────────────────────────────────
 
 // Writes payload into LSB of red channel pixels of a square noise PNG.
