@@ -53,7 +53,7 @@ Key derivation: PBKDF2-SHA256
   - iterations: 100,000
   - salt:       16 bytes, random per message
   - key length: 256 bits
-IV:             12 bytes, random per message (standard AES-GCM nonce)
+IV:             16 bytes, random per message (standard AES-GCM nonce)
 
 Ciphertext layout (hex-encoded, Vant-compatible):
   salt:iv:authTag:encrypted
@@ -338,7 +338,7 @@ Magic prefix:     "BRN:ENC:" (Vant-compatible)
 Version:          "1.0"
 PBKDF2 iters:     100,000
 Salt length:      16 bytes (32 hex chars)
-IV length:        12 bytes (24 hex chars)
+IV length:        16 bytes (32 hex chars)
 Auth tag:         16 bytes (32 hex chars)
 Min canvas (LSB): 32×32 pixels
 Room TTL:         7 days (604,800,000 ms)

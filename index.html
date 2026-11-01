@@ -15,10 +15,10 @@
     Load order: React → ReactDOM → Babel → Supabase, all before the
     <script type="text/babel"> block executes.
   -->
-  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" integrity="sha384-O56POiGzOyMTmZK2yMTZatGpquL4Fn1x3v6E0SlF+xQ0j0YzoPB3EqU0l1Yf" referrerpolicy="no-referrer"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" integrity="sha384-O56POiGzOyMTmZK2yMTZatGpquL4Fn1x3v6E0SlF+xQ0j0YzoPB3EqU0l1Yf" referrerpolicy="no-referrer"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js" integrity="sha384-O56POiGzOyMTmZK2yMTZatGpquL4Fn1x3v6E0SlF+xQ0j0YzoPB3EqU0l1Yf" referrerpolicy="no-referrer"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.112.3" integrity="sha384-VgERH0ayfLm+4J0rlX0slCVJN2bTf4W/ZXjT/hRiV2dFTH3DVRW1K6l3XGBW9" referrerpolicy="no-referrer"></script>
 
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
@@ -228,7 +228,7 @@ function recordSend()  { _lastSendTs = Date.now(); }
 // Vant-compatible encryption format:
 //   _PI  PBKDF2 iterations (100,000)
 //   _SB  Salt bytes (16)
-//   _IB  AES-GCM IV bytes (12) — standard AES-GCM nonce size
+//   _IB  AES-GCM IV bytes (16) — full AES block size, matches Vant format
 //   _BRN Magic "BRN:ENC:" text prefix (Vant-compatible)
 //   _VR  Version "1.0"
 //
@@ -236,7 +236,7 @@ function recordSend()  { _lastSendTs = Date.now(); }
 // Binary frame: "BRN:ENC:" + hex_payload
 // ══════════════════════════════════════════════════════════════════════════════
 
-const _PI=100_000, _SB=16, _IB=12, _BRN="BRN:", _VR="1.0";
+const _PI=100_000, _SB=16, _IB=16, _BRN="BRN:", _VR="1.0";
 const Enc = Object.freeze({ SVG:"svg", LSB:"lsb" });
 
 // ── Room ID derivation ────────────────────────────────────────────────────────
@@ -317,12 +317,9 @@ async function _ad(d, p) {
   } catch { return null; }
 }
 
-// ── Vant-compatible packet format ──────────────────────────────────────────────
-// Format: "BRN:ENC:<hex_payload>" (matches vant lib/stego.js exactly)
+// ── Packet format ─────────────────────────────────────────────────────────────
+// Format: "BRN:ENC:<hex_payload>" (Vant-compatible)
 // Payload is hex string of salt:iv:authTag:encrypted
-// ──────────────────────────────────────────────────────────────────────────────
-// Backward compatibility: also supports legacy SGF binary format
-// [0-2] Magic 0x53 0x47 0x46 | [3] Version | [4-7] uint32 length BE | [8+] payload
 
 function _pk(p) {
   // p is hex string from _ae - wrap with BRN:ENC: prefix
@@ -341,6 +338,15 @@ function _up(b) {
 }
 
 // ── Bit helpers ───────────────────────────────────────────────────────────────
+
+function _b2B(bits) {
+  const bytes=new Uint8Array(Math.ceil(bits.length/8));
+  for(let i=0;i<bits.length;i++){
+    const byteIdx=Math.floor(i/8), bitIdx=7-(i%8);
+    bytes[byteIdx]|=(bits[i]&1)<<bitIdx;
+  }
+  return bytes;
+}
 
 // ── LSB carrier ───────────────────────────────────────────────────────────────
 
