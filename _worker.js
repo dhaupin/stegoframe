@@ -37,6 +37,17 @@
  * KV mode:   key "rl:{ip}" with 60-second TTL — distributed across edge nodes
  * Memory mode: in-memory Map — works without KV but per-instance only
  *
+ * ── Rate limit trust boundary (read this before mirroring the worker) ────────
+ * The key is CF-Connecting-IP, which ONLY a Cloudflare edge sets. On a genuine
+ * Pages deployment a client cannot forge it, so the limit is real. Off the
+ * Cloudflare edge — a local run, a reverse proxy that forwards, a mirror on
+ * another host — the header is just another client-supplied string and a
+ * caller can rotate it to get a fresh bucket per request. The worker prefers
+ * the headers CF sets (CF-Connecting-IP, then CF-Pseudo-IPv4) and never keys
+ * on a header only the client could have supplied, but Pages exposes no socket
+ * peer address, so it cannot do better here. Anything that mirrors this worker
+ * off Cloudflare must replace the key with the real peer address.
+ *
  * This limit applies to HTML page loads only, not to Supabase API calls (which
  * go directly from the browser). For Supabase-level rate limiting, use Supabase
  * dashboard → API settings → rate limits, or add a Postgres function with
@@ -89,7 +100,11 @@ export default {
       pingSupabase(env);
 
       // ── Rate limit check ────────────────────────────────────────────────────
-      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      // Key on the headers a Cloudflare edge sets, never on a header only the
+      // client could supply (see the trust-boundary note in the file header).
+      const ip = request.headers.get("CF-Connecting-IP")
+        ?? request.headers.get("CF-Pseudo-IPv4")
+        ?? "unknown";
       const now = Date.now();
 
       if (env.SF_KV) {
@@ -137,14 +152,19 @@ export default {
       if (!asset.ok) return asset; // pass through 404s, etc.
 
       // ── Substitute environment variable placeholders ─────────────────────────
-      // Replace both placeholders in a single pass. If env vars are missing
-      // (e.g. not yet configured), substitution produces empty strings and the
-      // Supabase client will log a clear error — easier to debug than a cryptic
-      // runtime failure.
+      // Replace both placeholders in a single pass. The replacement is a
+      // FUNCTION, not a string: env values are data, and String.replace would
+      // otherwise expand `$&`, `$1`, `$'` and friends inside them (a value
+      // containing `$'` splices the rest of the document in, a value containing
+      // `$&` re-emits the placeholder — the stegoframe#7 mangling class).
+      // A function replacer inserts the value literally. If env vars are
+      // missing (e.g. not yet configured), substitution produces empty strings
+      // and the Supabase client will log a clear error — easier to debug than
+      // a cryptic runtime failure.
       let html = await asset.text();
       html = html
-        .replace(/\{\{SUPA_URL\}\}/g,  env.SUPA_URL  ?? "")
-        .replace(/\{\{SUPA_ANON\}\}/g, env.SUPA_ANON ?? "");
+        .replace(/\{\{SUPA_URL\}\}/g,  () => env.SUPA_URL  ?? "")
+        .replace(/\{\{SUPA_ANON\}\}/g, () => env.SUPA_ANON ?? "");
 
       // Return modified HTML with original status + headers intact
       // (preserves Content-Type, Cache-Control, ETag, etc. from Pages)
