@@ -106,9 +106,9 @@ The packed frame (hex-encoded string "BRN:ENC:...") is encoded into the least-si
 Pixel layout:  R G B A  (ImageData order)
 Payload bit:   LSB of R channel only
 Order:         sequential, left-to-right, top-to-bottom
-Header:        first 64 pixels encode the 8-byte frame header
-               (used to detect presence and read payload length)
-Remaining:     LENGTH*8 pixels encode the ciphertext bytes
+Framing:       first 4 pixels encode a big-endian u32 payload length N
+Next:          N*8 pixels encode the payload bytes ("BRN:ENC:hex_payload"),
+               MSB-first. Shared with Vant lib/stego.js — see docs/lsb-spec.md.
 ```
 
 Canvas dimensions: `ceil(sqrt(packedLength * 8))` × same, minimum 32×32.
