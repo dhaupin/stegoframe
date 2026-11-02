@@ -197,23 +197,22 @@ Brief overview: AI systems interact with Stegoframe as a transport layer, not a 
 ```
 Encryption:     AES-GCM-256
 Key derivation: PBKDF2-SHA256, 100,000 iterations, 16-byte random salt
-IV:             12 bytes random per message
-Frame header:   8 bytes (magic 3 + version 1 + length 4)
-Magic:          0x534746 ("SGF")
-Version:        0x02
+IV:             16 bytes random per message
+Wire framing:   4-byte big-endian payload length + payload bytes
+                (shared with Vant lib/stego.js — see docs/lsb-spec.md)
 ```
 
 SVG carrier extraction:
 ```js
-const m = svgText.match(/data-p="([A-Za-z0-9+/=]+)"/);
-const packed = base64ToBytes(m[1]);  // 8-byte header + ciphertext
+const m = svgText.match(/<brn:secret[^>]*>([A-Za-z0-9+/=]+)<\/brn:secret>/);
+const packed = base64ToBytes(m[1]);  // "BRN:ENC:hex" packet, no binary header
 ```
 
 LSB carrier extraction:
 ```js
-// Read R-channel LSBs sequentially from pixel data
-// First 64 bits = 8-byte frame header
-// Remaining LENGTH*8 bits = ciphertext bytes
+// Read R-channel LSBs sequentially from pixel data, MSB-first
+// First 32 bits = big-endian payload length N
+// Next N*8 bits  = payload bytes ("BRN:ENC:hex_payload")
 ```
 
 ---

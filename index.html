@@ -337,30 +337,68 @@ function _up(b) {
   return null;
 }
 
-// ── Bit helpers ───────────────────────────────────────────────────────────────
+// ── LSB wire helpers (shared dialect with Vant lib/stego.js) ──────────────────
+// Canonical LSB wire: [4-byte big-endian payload length][payload bytes],
+// packed MSB-first over UTF-8 bytes, ONE bit per pixel in the red channel's
+// LSB, x-major, left-to-right, top-to-bottom. A carrier with room to hold
+// the packet but different dims still reads correctly — capacity is never
+// part of the wire. Matches the new (pass-178) Vant PNG pipeline exactly.
 
-function _b2B(bits) {
-  const bytes=new Uint8Array(Math.ceil(bits.length/8));
-  for(let i=0;i<bits.length;i++){
-    const byteIdx=Math.floor(i/8), bitIdx=7-(i%8);
-    bytes[byteIdx]|=(bits[i]&1)<<bitIdx;
+// Convert a bit array (MSB-first stream) into bytes.
+function _barr2b(bits) {
+  const out = new Uint8Array(Math.floor(bits.length / 8));
+  for (let i = 0; i < out.length; i++) {
+    let byte = 0;
+    for (let j = 0; j < 8; j++) byte = (byte << 1) | (bits[i * 8 + j] & 1);
+    out[i] = byte;
   }
-  return bytes;
+  return out;
+}
+
+// Build the canonical LSB payload: u32 BE length header + packet bytes.
+function _lsbPayload(pkStr) {
+  const pkBytes = new TextEncoder().encode(pkStr);
+  const w = new DataView(new ArrayBuffer(4));
+  w.setUint32(0, pkBytes.length, false); // big-endian
+  const out = new Uint8Array(4 + pkBytes.length);
+  out.set(new Uint8Array(w.buffer), 0);
+  out.set(pkBytes, 4);
+  return out;
+}
+
+// Stream R-channel LSB bits (MSB-first) into bytes and parse the wire as
+// [u32 len][packet]; return the packet string ("" when no Vant packet), null
+// when no coherent length header is present. Caller passes a Uint8ClampedArray
+// of ImageData.data. Ceiling on bytes: every R-channel pixel is a bit.
+function _lsbExtract(d) {
+  const capacity = Math.floor(d.length / 4); // one bit per pixel
+  if (capacity < 4) return null;
+  const bits = new Array(Math.min(capacity * 8, 65536 * 8));
+  for (let i = 0; i < bits.length; i++) bits[i] = d[i * 4] & 1;
+  const bytes = _barr2b(bits);
+  if (bytes.length < 4) return null;
+  const len = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+  if (!Number.isSafeInteger(len) || len <= 0 || 4 + len > bytes.length) return null;
+  const packet = new TextDecoder().decode(bytes.slice(4, 4 + len));
+  return packet.startsWith(_BRN) ? packet : "";
 }
 
 // ── LSB carrier ───────────────────────────────────────────────────────────────
 
 // Writes payload into LSB of red channel pixels of a square noise PNG.
 // Alpha forced to 255 — transparency would reveal the image is synthetic.
+// Dimensions: now sized to carry the FULL canonical wire (header + packet),
+// not just the packet — the old writer never accounted for the 4-byte
+// length header its own reader tried to parse.
 function lsbWrite(payload) {
-  const pk=_pk(payload);
-  const dim=Math.max(32,Math.ceil(Math.sqrt(pk.length*8)));
+  const wire=_lsbPayload(_pk(payload));
+  const dim=Math.max(32,Math.ceil(Math.sqrt(wire.length*8)));
   const cv=document.createElement("canvas"); cv.width=cv.height=dim;
   const cx=cv.getContext("2d"), im=cx.createImageData(dim,dim);
   crypto.getRandomValues(im.data);
   for(let i=3;i<im.data.length;i+=4) im.data[i]=255;
-  for(let i=0;i<pk.length*8;i++){
-    const bit=(pk[Math.floor(i/8)]>>(7-(i%8)))&1;
+  for(let i=0;i<wire.length*8;i++){
+    const bit=(wire[Math.floor(i/8)]>>(7-(i%8)))&1;
     im.data[i*4]=(im.data[i*4]&0xFE)|bit;
   }
   cx.putImageData(im,0,0); return cv.toDataURL("image/png");
@@ -375,12 +413,8 @@ async function lsbRead(url) {
       const cv=document.createElement("canvas"); cv.width=im.width; cv.height=im.height;
       const cx=cv.getContext("2d"); cx.drawImage(im,0,0);
       const d=cx.getImageData(0,0,im.width,im.height).data;
-      const hb=[]; for(let i=0;i<64;i++) hb.push(d[i*4]&1);
-      const hdr=_b2B(hb);
-      if(!_up(hdr)){res(null);return;}
-      const l=(hdr[4]<<24)|(hdr[5]<<16)|(hdr[6]<<8)|hdr[7],tb=(8+l)*8,ab=[];
-      for(let i=0;i<tb;i++) ab.push(d[i*4]&1);
-      res(_up(_b2B(ab)));
+      const packet=_lsbExtract(d);
+      res(packet ? _up(packet) : null); // "" → wrong dialect → null
     };
     im.onerror=()=>res(null); im.src=url;
   });
