@@ -236,6 +236,7 @@ function recordSend()  { _lastSendTs = Date.now(); }
 // Binary frame: "BRN:ENC:" + hex_payload
 // ══════════════════════════════════════════════════════════════════════════════
 
+// <<<STEGOFRAME_CODEC_START>>> - the codec block the tests extract verbatim (tests/codec.test.js). Do not remove.
 const _PI=100_000, _SB=16, _IB=16, _BRN="BRN:", _VR="1.0";
 const Enc = Object.freeze({ SVG:"svg", LSB:"lsb" });
 
@@ -419,6 +420,8 @@ async function lsbRead(url) {
     im.onerror=()=>res(null); im.src=url;
   });
 }
+
+// <<<STEGOFRAME_CODEC_END>>>
 
 // ── SVG carrier ───────────────────────────────────────────────────────────────
 
