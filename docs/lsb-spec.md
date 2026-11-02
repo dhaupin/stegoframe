@@ -82,6 +82,24 @@ reparses).
   LSB stones can simply be re-encoded. The SGF binary magic is dropped
   from the read path too (it never existed on any write path).
 
+## Test pin (this repo)
+
+The wire is pinned by `npm test`, and the pin runs the REAL codec code, not a
+copy:
+
+- `tests/codec-extract.js` slices the codec block out of `index.html` between
+  the `<<<STEGOFRAME_CODEC_START>>>` / `<<<STEGOFRAME_CODEC_END>>>` markers and
+  evaluates it. The tests import `_lsbPayload` / `_lsbExtract` / `lsbWrite` /
+  `lsbRead` from there, so a change in the app is a change the tests see - the
+  previous hand-copied mirror (which had an SGF branch the app never had) is
+  gone for good. Do not remove those markers.
+- `tests/fixtures/lsb-stone.png` is a committed golden stone: a real PNG
+  written on this wire (deterministic seeded noise plane), decoded back to a
+  flat RGBA plane by `tests/png.js` and asserted to recover the exact packet.
+- A `Wire version pin` block asserts the header bytes, the MSB-first/x-major
+  bit order, and the version marker, so any change to the wire (bit order,
+  header size, magic) fails loudly.
+
 ## Reader pseudocode (drop-in for any platform)
 
 ```js

@@ -1,136 +1,60 @@
 /**
  * Stegoframe Codec Tests
  * Run with: npm test
- * Or: node --test tests/codec.test.mjs
+ *
+ * These tests exercise the REAL codec code: `tests/codec-extract.js` slices
+ * the codec block out of `index.html` (between the STEGOFRAME_CODEC markers)
+ * and evaluates it, so there is no hand-copied mirror to drift. If the app
+ * code changes shape, these tests see the change - that is the point.
  */
-
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { webcrypto } from 'node:crypto';
 
-// Node 18 floor: `node:crypto`'s webcrypto exposes subtle + getRandomValues
-// on every supported Node; the bare `crypto` global only lands in Node 19.
-const crypto = webcrypto;
+import { loadCodec, extractCodecSource } from './codec-extract.js';
+import { decodePng } from './png.js';
 
-// ── Constants (must match index.html) ────────────────────────────────────────
-const _PI = 100_000;  // PBKDF2 iterations
-const _SB = 16;       // salt bytes
-const _IB = 16;       // IV bytes
-const _BRN = "BRN:";  // packet prefix
+const crypto = webcrypto; // Node 18 floor: bare `crypto` global lands in Node 19
+const HERE = dirname(fileURLToPath(import.meta.url));
 
-// ── Copy of codec functions from index.html for testing ──────────────────────
+// The real definitions, straight from index.html.
+const {
+  _PI, _SB, _IB, _BRN, _VR, Enc, deriveRoomId,
+  _toHex, _fromHex, _ae, _ad, _pk, _up,
+  _lsbPayload, _lsbExtract, lsbWrite, lsbRead,
+} = loadCodec();
 
-const _ROOM_SALT = "stegoframe-v1";
+// ── Codec wiring: the extractor sees the real block, not a copy ──────────────
+describe('Codec block wiring (extracted from index.html)', () => {
+  it('finds the codec markers and a non-empty block', () => {
+    const src = extractCodecSource();
+    assert.ok(src.includes('function _lsbExtract'), 'block carries _lsbExtract');
+    assert.ok(src.includes('function lsbWrite'), 'block carries lsbWrite');
+  });
 
-async function deriveRoomId(passphrase) {
-  const data = new TextEncoder().encode(passphrase + _ROOM_SALT);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  const hex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
-  return hex.substring(0, 6);
-}
+  it('exposes the real carrier functions (protects against a rename)', () => {
+    assert.strictEqual(typeof lsbWrite, 'function');
+    assert.strictEqual(typeof lsbRead, 'function');
+    assert.strictEqual(typeof _lsbPayload, 'function');
+    assert.strictEqual(typeof _lsbExtract, 'function');
+  });
 
-function _toHex(buf) {
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
+  it('pins the constants the wire depends on', () => {
+    assert.strictEqual(_BRN, 'BRN:');
+    assert.strictEqual(_IB, 16, 'IV is 16 bytes (full AES block, Vant format)');
+    assert.strictEqual(_SB, 16);
+    assert.strictEqual(_PI, 100_000);
+    assert.deepStrictEqual(Enc, { SVG: 'svg', LSB: 'lsb' });
+  });
+});
 
-function _fromHex(hex) {
-  const buf = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < buf.length; i++) buf[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return buf;
-}
-
-async function _dk(p, s) {
-  const k = await crypto.subtle.importKey(
-    "raw", new TextEncoder().encode(p), { name: "PBKDF2" }, false, ["deriveKey"]
-  );
-  return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: s, iterations: _PI, hash: "SHA-256" },
-    k, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
-  );
-}
-
-async function _ae(txt, p) {
-  const s = crypto.getRandomValues(new Uint8Array(_SB));
-  const iv = crypto.getRandomValues(new Uint8Array(_IB));
-  const ek = await _dk(p, s);
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, ek, new TextEncoder().encode(txt));
-  const ctArr = new Uint8Array(ct);
-  const encrypted = ctArr.slice(0, ctArr.byteLength - 16);
-  const authTag = ctArr.slice(ctArr.byteLength - 16);
-  return _toHex(s) + ":" + _toHex(iv) + ":" + _toHex(authTag) + ":" + _toHex(encrypted);
-}
-
-async function _ad(d, p) {
-  try {
-    let hex = typeof d === 'string' ? d : _toHex(d);
-    const parts = hex.split(":");
-    if (parts.length !== 4) return null;
-    const s = _fromHex(parts[0]);
-    const iv = _fromHex(parts[1]);
-    const authTag = _fromHex(parts[2]);
-    const encrypted = _fromHex(parts[3]);
-    const ct = new Uint8Array(encrypted.byteLength + authTag.byteLength);
-    ct.set(encrypted, 0);
-    ct.set(authTag, encrypted.byteLength);
-    const ek = await _dk(p, s);
-    return new TextDecoder().decode(
-      await crypto.subtle.decrypt({ name: "AES-GCM", iv }, ek, ct)
-    );
-  } catch { return null; }
-}
-
-function _pk(p) {
-  return _BRN + "ENC:" + p;
-}
-
-function _up(b) {
-  const s = typeof b === 'string' ? b : new TextDecoder().decode(b);
-  if (s.startsWith(_BRN + "ENC:")) {
-    return s.slice(_BRN.length + 4);
-  }
-  return null;
-}
-
-// ── LSB wire helpers (mirror index.html exactly — keep in sync) ──────────────
-function _barr2b(bits) {
-  const out = new Uint8Array(Math.floor(bits.length / 8));
-  for (let i = 0; i < out.length; i++) {
-    let byte = 0;
-    for (let j = 0; j < 8; j++) byte = (byte << 1) | (bits[i * 8 + j] & 1);
-    out[i] = byte;
-  }
-  return out;
-}
-
-function _lsbPayload(pkStr) {
-  const pkBytes = new TextEncoder().encode(pkStr);
-  const w = new DataView(new ArrayBuffer(4));
-  w.setUint32(0, pkBytes.length, false); // big-endian
-  const out = new Uint8Array(4 + pkBytes.length);
-  out.set(new Uint8Array(w.buffer), 0);
-  out.set(pkBytes, 4);
-  return out;
-}
-
-function _lsbExtract(d) {
-  const capacity = Math.floor(d.length / 4);
-  if (capacity < 4) return null;
-  const bits = new Array(Math.min(capacity * 8, 65536 * 8));
-  for (let i = 0; i < bits.length; i++) bits[i] = d[i * 4] & 1;
-  const bytes = _barr2b(bits);
-  if (bytes.length < 4) return null;
-  const len = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
-  if (!Number.isSafeInteger(len) || len <= 0 || 4 + len > bytes.length) return null;
-  const packet = new TextDecoder().decode(bytes.slice(4, 4 + len));
-  return packet.startsWith(_BRN) ? packet : "";
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────────
-
+// ── Hex Encoding ─────────────────────────────────────────────────────────────
 describe('Hex Encoding', () => {
   it('should encode Uint8Array to hex string', () => {
-    const buf = new Uint8Array([0x01, 0xAB, 0xFF]);
-    assert.strictEqual(_toHex(buf), '01abff');
+    assert.strictEqual(_toHex(new Uint8Array([0x01, 0xAB, 0xFF])), '01abff');
   });
 
   it('should decode hex string to Uint8Array', () => {
@@ -143,24 +67,18 @@ describe('Hex Encoding', () => {
 
   it('should round-trip hex encoding', () => {
     const original = crypto.getRandomValues(new Uint8Array(32));
-    const hex = _toHex(original);
-    const decoded = _fromHex(hex);
-    assert.deepStrictEqual(decoded, original);
+    assert.deepStrictEqual(_fromHex(_toHex(original)), original);
   });
 });
 
+// ── Packet Format (BRN:ENC:) ─────────────────────────────────────────────────
 describe('Packet Format (BRN:ENC:)', () => {
   it('should pack hex payload with BRN:ENC: prefix', () => {
-    const hex = 'deadbeef1234';
-    const packed = _pk(hex);
-    assert.strictEqual(packed, 'BRN:ENC:deadbeef1234');
+    assert.strictEqual(_pk('deadbeef1234'), 'BRN:ENC:deadbeef1234');
   });
 
   it('should unpack BRN:ENC: payload', () => {
-    const hex = 'deadbeef1234';
-    const packed = _pk(hex);
-    const unpacked = _up(packed);
-    assert.strictEqual(unpacked, hex);
+    assert.strictEqual(_up(_pk('deadbeef1234')), 'deadbeef1234');
   });
 
   it('should return null for invalid format', () => {
@@ -168,6 +86,7 @@ describe('Packet Format (BRN:ENC:)', () => {
   });
 });
 
+// ── AES-GCM Encryption ───────────────────────────────────────────────────────
 describe('AES-GCM Encryption', () => {
   it('should encrypt and decrypt successfully', async () => {
     const plaintext = 'Hello, Stegoframe!';
@@ -175,100 +94,74 @@ describe('AES-GCM Encryption', () => {
 
     const encrypted = await _ae(plaintext, passphrase);
     assert.ok(encrypted.includes(':'), 'Encrypted should be colon-separated');
-    
+
     const parts = encrypted.split(':');
     assert.strictEqual(parts.length, 4, 'Should have 4 parts');
     assert.strictEqual(parts[0].length, _SB * 2, 'Salt should be 32 hex chars');
-    assert.strictEqual(parts[1].length, _IB * 2, 'IV should be 24 hex chars');
+    assert.strictEqual(parts[1].length, _IB * 2, 'IV should be 32 hex chars');
     assert.strictEqual(parts[2].length, 32, 'Auth tag should be 32 hex chars');
 
-    const decrypted = await _ad(encrypted, passphrase);
-    assert.strictEqual(decrypted, plaintext);
+    assert.strictEqual(await _ad(encrypted, passphrase), plaintext);
   });
 
   it('should produce different ciphertext each time (random salt)', async () => {
-    const plaintext = 'Same message';
-    const passphrase = 'same-passphrase';
-
-    const encrypted1 = await _ae(plaintext, passphrase);
-    const encrypted2 = await _ae(plaintext, passphrase);
-
-    assert.notStrictEqual(encrypted1, encrypted2, 'Same message should produce different ciphertext');
-
-    // But both should decrypt to same plaintext
-    assert.strictEqual(await _ad(encrypted1, passphrase), plaintext);
-    assert.strictEqual(await _ad(encrypted2, passphrase), plaintext);
+    const encrypted1 = await _ae('Same message', 'same-passphrase');
+    const encrypted2 = await _ae('Same message', 'same-passphrase');
+    assert.notStrictEqual(encrypted1, encrypted2);
+    assert.strictEqual(await _ad(encrypted1, 'same-passphrase'), 'Same message');
+    assert.strictEqual(await _ad(encrypted2, 'same-passphrase'), 'Same message');
   });
 
   it('should return null with wrong passphrase', async () => {
     const encrypted = await _ae('Secret message', 'correct-pass');
-    const decrypted = await _ad(encrypted, 'wrong-pass');
-    assert.strictEqual(decrypted, null);
+    assert.strictEqual(await _ad(encrypted, 'wrong-pass'), null);
   });
 
   it('should return null for tampered ciphertext', async () => {
     const encrypted = await _ae('Original message', 'pass');
     const parts = encrypted.split(':');
-    // Tamper with the encrypted part - change last char
     const lastIdx = parts[3].length - 1;
-    const originalChar = parts[3][lastIdx];
-    const tamperedChar = originalChar === '0' ? '1' : '0';
-    const tamperedHex = parts[3].slice(0, lastIdx) + tamperedChar;
-    const tampered = parts.slice(0, 3).concat(tamperedHex).join(':');
-    const decrypted = await _ad(tampered, 'pass');
-    assert.strictEqual(decrypted, null);
+    const tamperedChar = parts[3][lastIdx] === '0' ? '1' : '0';
+    const tampered = parts.slice(0, 3).concat(parts[3].slice(0, lastIdx) + tamperedChar).join(':');
+    assert.strictEqual(await _ad(tampered, 'pass'), null);
   });
 
   it('should handle empty string', async () => {
     const encrypted = await _ae('', 'pass');
-    const decrypted = await _ad(encrypted, 'pass');
-    assert.strictEqual(decrypted, '');
+    assert.strictEqual(await _ad(encrypted, 'pass'), '');
   });
 
   it('should handle unicode characters', async () => {
     const plaintext = 'Hello 🌍 你好 🎉';
-    const passphrase = 'unicode-test';
-
-    const encrypted = await _ae(plaintext, passphrase);
-    const decrypted = await _ad(encrypted, passphrase);
-    assert.strictEqual(decrypted, plaintext);
+    const encrypted = await _ae(plaintext, 'unicode-test');
+    assert.strictEqual(await _ad(encrypted, 'unicode-test'), plaintext);
   });
 
   it('should handle long messages', async () => {
     const plaintext = 'A'.repeat(10000);
-    const passphrase = 'long-message-test';
-
-    const encrypted = await _ae(plaintext, passphrase);
-    const decrypted = await _ad(encrypted, passphrase);
-    assert.strictEqual(decrypted, plaintext);
+    const encrypted = await _ae(plaintext, 'long-message-test');
+    assert.strictEqual(await _ad(encrypted, 'long-message-test'), plaintext);
   });
 });
 
+// ── Full Codec Round-trip ────────────────────────────────────────────────────
 describe('Full Codec Round-trip', () => {
   it('should encrypt, pack, unpack, and decrypt', async () => {
     const plaintext = 'Full round-trip test!';
     const passphrase = 'round-trip-pass';
 
-    // Encrypt
-    const encrypted = await _ae(plaintext, passphrase);
-    
-    // Pack
-    const packed = _pk(encrypted);
+    const packed = _pk(await _ae(plaintext, passphrase));
     assert.ok(packed.startsWith('BRN:ENC:'));
 
-    // Unpack
     const unpacked = _up(packed);
-    assert.strictEqual(unpacked, encrypted);
-
-    // Decrypt
-    const decrypted = await _ad(unpacked, passphrase);
-    assert.strictEqual(decrypted, plaintext);
+    assert.strictEqual(await _ad(unpacked, passphrase), plaintext);
   });
 });
 
-// ── Wire-level LSB tests (canvas-free): exercise _lsbPayload/_lsbExtract
-// exactly as lsbWrite/lsbRead do, minus the DOM round-trip (which is
-// browser-only). The bit plane is a fake ImageData.data: R at [i*4].
+// ── LSB wire (canonical [len][packet] header) ────────────────────────────────
+// fakeRPlane builds a flat RGBA byte plane (R at [i*4]) with the wire streamed
+// into the R-channel LSBs exactly as lsbWrite does - the same shape
+// getImageData() hands to _lsbExtract in the browser.
 describe('LSB wire (canonical [len][packet] header)', () => {
   function fakeRPlane(bytes) {
     const dim = Math.max(32, Math.ceil(Math.sqrt(bytes.length * 8)));
@@ -283,8 +176,7 @@ describe('LSB wire (canonical [len][packet] header)', () => {
 
   it('round-trips a packet through the wire', () => {
     const hex = _toHex(crypto.getRandomValues(new Uint8Array(48)));
-    const wire = _lsbPayload(_pk(hex));
-    const packet = _lsbExtract(fakeRPlane(wire));
+    const packet = _lsbExtract(fakeRPlane(_lsbPayload(_pk(hex))));
     assert.strictEqual(packet, _pk(hex));
     assert.strictEqual(_up(packet), hex);
   });
@@ -302,45 +194,93 @@ describe('LSB wire (canonical [len][packet] header)', () => {
   });
 
   it('returns "" on a plane whose length is valid but no BRN packet follows', () => {
-    const d = fakeRPlane(_lsbPayload('NOT-BRN'));
-    assert.strictEqual(_lsbExtract(d), '');
+    assert.strictEqual(_lsbExtract(fakeRPlane(_lsbPayload('NOT-BRN'))), '');
   });
 
   it('matches the exact Vant LSB layout pass-178 pins: BE length + MSB-first', () => {
-    // Build the Vant wire by hand: u32BE(4) + 'BRN:' → bits MSB-first.
-    // (Packet must start with the 'BRN:' magic INCLUSIVE of the colon to
-    // pass the guard — 'BRN' without colon is correctly rejected as '' —
-    // and the roundtrip test above covers the full _pk/_up path.)
-    const msg = 'BRN:';
+    // Build the Vant wire by hand: u32BE(4) + 'BRN:' -> bits MSB-first.
     const bytes = new Uint8Array([0, 0, 0, 4, 0x42, 0x52, 0x4E, 0x3A]);
-    const packet = _lsbExtract(fakeRPlane(bytes));
-    assert.strictEqual(packet, msg);
+    assert.strictEqual(_lsbExtract(fakeRPlane(bytes)), 'BRN:');
   });
 });
 
+// ── Golden stone: a committed PNG written by the wire ────────────────────────
+// tests/fixtures/lsb-stone.png was produced by the same [len][packet] wire
+// (deterministic noise plane, seeded) so it is a real artifact a browser
+// `new Image()` rasterizes. If the wire ever changes shape, this pin fails
+// loudly instead of silently accepting a drifted layout.
+describe('Golden stone (committed PNG carrier)', () => {
+  const GOLDEN_PACKET =
+    'BRN:ENC:00112233445566778899aabbccddeeff' +
+    '000102030405060708090a0b0c0d0e0f' +
+    'deadbeefcafebabe0011223344556677' +
+    '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
+
+  it('recovers the exact packet from the committed PNG', () => {
+    const png = readFileSync(join(HERE, 'fixtures', 'lsb-stone.png'));
+    const { width, height, rgba } = decodePng(png);
+    assert.strictEqual(width, 34);
+    assert.strictEqual(height, 34);
+    assert.strictEqual(_lsbExtract(rgba), GOLDEN_PACKET);
+    // And the real read path's unwrap yields the hex payload.
+    assert.strictEqual(_up(_lsbExtract(rgba)), GOLDEN_PACKET.slice('BRN:ENC:'.length));
+  });
+
+  it('does not accept a foreign-dialect plane as a packet', () => {
+    // Same dims, no wire: the reader must answer "" (not a payload), never
+    // a garbage packet, so a static-noise image reads as empty.
+    const { width, height } = decodePng(readFileSync(join(HERE, 'fixtures', 'lsb-stone.png')));
+    const blank = new Uint8ClampedArray(width * height * 4).fill(0);
+    const out = _lsbExtract(blank);
+    assert.ok(out === '' || out === null, `expected empty/null, got ${JSON.stringify(out)}`);
+  });
+});
+
+// ── Wire version pin ─────────────────────────────────────────────────────────
+// Any change to the wire (bit order, header size, magic) must fail here.
+describe('Wire version pin (v1.1)', () => {
+  it('lays the header as u32 big-endian then the packet bytes', () => {
+    const wire = _lsbPayload('BRN:');
+    assert.deepStrictEqual(Array.from(wire), [0x00, 0x00, 0x00, 0x04, 0x42, 0x52, 0x4E, 0x3A]);
+  });
+
+  it('streams MSB-first, one bit per R-channel pixel, x-major', () => {
+    const brn = _lsbPayload('BRN:');
+    const d = new Uint8ClampedArray(32 * 32 * 4);
+    for (let i = 0; i < d.length; i++) d[i] = (i * 53) & 0xFF;
+    for (let i = 0; i < brn.length * 8; i++) {
+      const bit = (brn[Math.floor(i / 8)] >> (7 - (i % 8))) & 1;
+      d[i * 4] = (d[i * 4] & 0xFE) | bit;
+    }
+    assert.strictEqual(_lsbExtract(d), 'BRN:');
+    // Flip the first bit: the length header becomes 0x80000004 (absurd) -> null.
+    d[0] = d[0] ^ 1;
+    assert.strictEqual(_lsbExtract(d), null);
+  });
+
+  it('carries the version marker the SVG path stamps', () => {
+    assert.strictEqual(_VR, '1.0', 'SVG <desc data-f> version; bump consciously');
+  });
+});
+
+// ── deriveRoomId ─────────────────────────────────────────────────────────────
 describe('deriveRoomId', () => {
   it('should derive a 6-character lowercase alphanumeric room ID', async () => {
     const roomId = await deriveRoomId('my-secret-passphrase');
     assert.strictEqual(roomId.length, 6);
-    assert.ok(/^[a-z0-9]+$/.test(roomId), 'Room ID should be lowercase alphanumeric');
+    assert.ok(/^[a-z0-9]+$/.test(roomId));
   });
 
   it('should derive the same room ID for the same passphrase', async () => {
-    const roomId1 = await deriveRoomId('same-passphrase');
-    const roomId2 = await deriveRoomId('same-passphrase');
-    assert.strictEqual(roomId1, roomId2);
+    assert.strictEqual(await deriveRoomId('same-passphrase'), await deriveRoomId('same-passphrase'));
   });
 
   it('should derive different room IDs for different passphrases', async () => {
-    const roomId1 = await deriveRoomId('passphrase-a');
-    const roomId2 = await deriveRoomId('passphrase-b');
-    assert.notStrictEqual(roomId1, roomId2);
+    assert.notStrictEqual(await deriveRoomId('passphrase-a'), await deriveRoomId('passphrase-b'));
   });
 
   it('should be case-sensitive for passphrases', async () => {
-    const roomId1 = await deriveRoomId('Secret123');
-    const roomId2 = await deriveRoomId('secret123');
-    assert.notStrictEqual(roomId1, roomId2);
+    assert.notStrictEqual(await deriveRoomId('Secret123'), await deriveRoomId('secret123'));
   });
 
   it('should handle unicode passphrases', async () => {

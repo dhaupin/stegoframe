@@ -116,6 +116,8 @@ Background: random noise (crypto.getRandomValues) with alpha forced to 255.
 
 Data URL format: `data:image/png;base64,...`
 
+**Test pin:** the wire is pinned by `npm test` against the REAL codec code, not a copy: `tests/codec-extract.js` slices the block out of `index.html` between the `<<<STEGOFRAME_CODEC_START>>>` / `<<<STEGOFRAME_CODEC_END>>>` markers (do not remove them) and the tests import the live functions; `tests/fixtures/lsb-stone.png` is a committed golden stone decoded back through `tests/png.js`. Any wire change (bit order, header size, magic) fails the pin loudly. Full contract: [`docs/lsb-spec.md`](./docs/lsb-spec.md).
+
 **Important:** When reading LSB carriers, do not set `crossOrigin` on the Image element. Data URLs are same-origin; setting `crossOrigin="anonymous"` causes canvas tainting in Chrome/Android and silently breaks `getImageData()`.
 
 ---

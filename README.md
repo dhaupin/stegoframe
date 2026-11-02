@@ -22,23 +22,25 @@ The server (Supabase) only ever sees encrypted carrier images. Without the passp
 
 | Mode | Carrier looks like | Payload location |
 |------|--------------------|-----------------|
-| SVG  | Abstract gradient art | `<desc data-p="...">` base64 attribute |
+| SVG  | Abstract gradient art | `<brn:secret>` base64 attribute |
 | LSB  | Pixel noise / static | Least-significant bits of red channel pixels |
 
 Both modes use the same encryption layer. Mode is fixed per room and shared via the URL query string.
 
 ### Binary framing
 
-All payloads are wrapped in an 8-byte frame header before encryption:
+The ciphertext is wrapped in a `BRN:ENC:` packet, then carried in the image:
 
 ```
-[0-2]  MAGIC   0x534746 ("SGF")
-[3]    VERSION 0x02
-[4-7]  LENGTH  uint32 big-endian (payload byte count)
-[8+]   PAYLOAD encrypted bytes
+packet:   "BRN:ENC:" + hex(salt):hex(iv):hex(authTag):hex(ciphertext)
+          (AES-256-GCM, PBKDF2-SHA256 100k, salt 16B, IV 16B)
+
+LSB wire: [4-byte big-endian payload length][packet bytes]
+          MSB-first, one bit per pixel, R-channel LSB, x-major
+          (shared with Vant lib/stego.js - see docs/lsb-spec.md)
 ```
 
-Magic + version mismatch = null decode. Wrong passphrase = AES-GCM auth failure = null decode. Both cases are silent.
+A carrier whose payload does not start with the `BRN:` magic reads as no payload (empty), never a garbage packet. Wrong passphrase = AES-GCM auth failure = null decode. Both cases are silent.
 
 ---
 
