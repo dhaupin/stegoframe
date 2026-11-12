@@ -1,0 +1,18 @@
+# This repo declares no npm dependencies (railyard is a service, not a
+# package; stegoframe's package.json carries none), so only the
+# github-actions ecosystem applies: it moves the SHA-pinned `uses:` refs
+# (packstruct#69) without a hand-edit. Shape: railyard#31.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
