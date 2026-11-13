@@ -16,6 +16,11 @@ stegoframe is an identity-agnostic steganographic transport middleware. It encry
 
 ## Log
 
+### 2026-11-13 - the staging fast-forward sync lands (the family plumbing)
+
+- **Added `.github/workflows/staging-ff-sync.yml`** - the family's required sync step, vendored byte-identical from the coreforge canon (44 lines). On every push to `main` it fast-forwards `staging` with a fast-forward-only refspec (never a merge, never a force-push); the `delete` trigger recreates `staging` if the `--delete-branch` trap removes it. stegoframe had `main` + `staging` but carried no workflow at all, so the mirror was manual.
+- **No version bump** (1.0.0 = 1.0.0); a plumbing pass.
+
 ### 2026-11-12 - the memory convention lands (railyard#31)
 
 - **Added `CHANGELOG.md`** (Keep a Changelog) with the 1.0.0 section reconstructed from the tree and the first `[Unreleased]` entry for the Dependabot flow.

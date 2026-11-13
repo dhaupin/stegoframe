@@ -4,6 +4,10 @@ All notable changes to stegoframe are documented here. The format is based on [K
 
 ## [Unreleased]
 
+### 2026-11-13 - the staging fast-forward sync lands (the family plumbing)
+
+`staging` is a permanent integration branch and a mirror of `main`; a merge-commit promotion puts a commit on `main` that `staging` lacks, so the two drift on every promotion even when the flow is followed exactly. `.github/workflows/staging-ff-sync.yml` is the family's required sync step: on every push to `main` it fast-forwards `staging` with a fast-forward-only refspec (`git push origin origin/main:refs/heads/staging`) - never a merge, never a force-push - so a real divergence fails the job loudly instead of rewriting history. The `delete` trigger recreates `staging` if it is ever removed (the `--delete-branch` trap deletes the promote PR's own head). Vendored byte-identical from the coreforge canon (44 lines), the same file the rest of the family runs. No version bump.
+
 ### 2026-11-12 - the Dependabot flow lands (railyard#31)
 
 `.github/dependabot.yml` now carries the family flow: a weekly (Monday) pass, grouped minor/patch updates in one pull request, majors alone, and the `github-actions` ecosystem so the SHA-pinned refs move without a hand-edit. stegoframe declares no npm dependencies, so the `github-actions` ecosystem alone applies. The shape is proved and guarded on the parent (`dhaupin/creadev` PR #38; `dhaupin/railyard#31`). No version bump.
